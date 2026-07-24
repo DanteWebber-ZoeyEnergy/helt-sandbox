@@ -1,0 +1,18 @@
+# Secrets and device credentials -- NEVER commit these
+aws/config.env
+aws/certs/
+*.pem
+*.key
+*.arn
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS noise
+.DS_Store
+
+# Session/scratch logs -- may contain echoed secrets
+terminal.txt
