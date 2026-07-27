@@ -22,7 +22,7 @@ Environment variables:
 
 Stdlib only.
 """
-import csv, io, json, os, re, urllib.request, urllib.error, urllib.parse
+import csv, io, json, os, re, time, urllib.request, urllib.error, urllib.parse
 
 URL    = os.environ["INFLUXDB_URL"]
 TOKEN  = os.environ["INFLUXDB_READ_TOKEN"]
@@ -83,21 +83,27 @@ def influx_query(flux):
 
 
 def get_packs():
+    # Liveness = telemetry freshness, NOT status events. A stably-connected
+    # pack can go days without a connect/disconnect event (the LWT still lands
+    # promptly on a real drop, but fresh data is the honest "online" signal).
     # pack_id is a tag, so InfluxDB returns one table per pack; last() then
-    # yields exactly one row per pack seen in the window
+    # yields exactly one row per pack seen in the window.
     flux = (
         f'from(bucket:"{BUCKET}")'
-        f'|> range(start:-7d)'
-        f'|> filter(fn:(r)=> r._measurement=="pack_status" and r._field=="online")'
+        f'|> range(start:-30d)'
+        f'|> filter(fn:(r)=> r._measurement=="telemetry" and r._field=="soc_pct")'
         f'|> last()'
-        f'|> keep(columns:["pack_id","_value","_time"])'
+        f'|> keep(columns:["pack_id","_time"])'
     )
+    now = time.time()
     packs = []
     for r in influx_query(flux):
         pid = r.get("pack_id")
         if pid:
-            packs.append({"pack_id": pid, "online": _num(r.get("_value")),
-                          "last_seen": _iso_to_epoch(r.get("_time", ""))})
+            last_seen = _iso_to_epoch(r.get("_time", ""))
+            packs.append({"pack_id": pid,
+                          "online": (now - last_seen) < 90,   # 3x fw batch period
+                          "last_seen": last_seen})
     packs.sort(key=lambda p: p["pack_id"])
     return reply(200, {"packs": packs})
 
@@ -117,9 +123,12 @@ def get_latest(pack_id):
             telemetry[f] = _num(v)
         newest = max(newest, _iso_to_epoch(r.get("_time", "")))
 
+    # 30d lookback: the retained status is event-driven, so on a stable
+    # connection the newest row can legitimately be days old (a real drop
+    # still writes a fresh online:false via the LWT immediately)
     flux_status = (
         f'from(bucket:"{BUCKET}")'
-        f'|> range(start:-24h)'
+        f'|> range(start:-30d)'
         f'|> filter(fn:(r)=> r._measurement=="pack_status" and r.pack_id=="{pack_id}")'
         f'|> last()'
     )

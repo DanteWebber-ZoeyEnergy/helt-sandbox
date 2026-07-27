@@ -488,15 +488,16 @@ async function pool(thunks, width) {
 async function pollLatest() {
   try {
     const d = await getJSON(`/packs/${PACK}/latest`);
-    const t = d.telemetry || {}, s = d.status || {};
-    const online = s.online === true || s.online === 1;
+    const t = d.telemetry || {};
+    // liveness = telemetry freshness (90 s ≈ 3x the firmware's 30 s batch
+    // period) — the retained status flag can be days old on a stable connection
+    const age = d.updated_ts ? Math.max(0, Math.round(Date.now() / 1000 - d.updated_ts)) : null;
+    const online = age != null && age < 90;
 
     $("pid").textContent = d.pack_id || PACK;
     $("stateTxt").textContent = online ? "online" : "offline";
     $("packPill").className = "pill " + (online ? "online" : "offline");
-    $("age").textContent = d.updated_ts
-      ? `updated ${Math.max(0, Math.round(Date.now() / 1000 - d.updated_ts))} s ago`
-      : "no data yet";
+    $("age").textContent = age != null ? `updated ${age} s ago` : "no data yet";
 
     $("k_soc").textContent = fmt(t.soc_pct, 0);
     $("socMeter").style.width = `${Math.min(100, Math.max(0, t.soc_pct ?? 0))}%`;
