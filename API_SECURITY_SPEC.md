@@ -139,6 +139,28 @@ query Lambda
 
 ## 5. Rate limiting and cost containment
 
+**Measured (2026-07-27, 5-pack fleet):** the pipeline itself costs ~$10.7/mo;
+the dominant *variable* cost is **InfluxDB query executions ($0.012/100)** —
+the original dashboard fired ~61 queries/min (~$0.44/hour per open tab, ~97%
+of a 24/7 bill). Mitigations, applied to the sandbox and carried forward as
+requirements on the production API:
+
+1. **Response cache in the query Lambda** (30 s TTL, per container): N
+   concurrent viewers share one InfluxDB query per window. This must survive
+   the S2 authorization work — cache keys include the pack + range but sit
+   *behind* the entitlement check (cache the Influx read, filter per user).
+2. **One bundled query per refresh** (`/histories`): all fields + GPS trail
+   in a single Flux query instead of 10.
+3. **`/latest` drops its status sub-query** unless `?status=1` — liveness
+   derives from telemetry freshness.
+4. **Client cadence = data cadence:** the dashboard polls every 30 s (matching
+   the firmware's 30 s batching); faster polling only re-reads the cache.
+5. **InfluxDB retention policy** (not yet applied): cap `helt_sandbox` at
+   e.g. 90 d so storage stops accumulating (~+0.35 GB compressed/month today).
+
+Net effect: ~5 InfluxDB queries/min per active pack view (~$0.036/hour,
+~12× cheaper), and additional simultaneous viewers are nearly free.
+
 - **Stage throttle now (HTTP API supports this):** rate 10 req/s, burst 20 —
   sized to the 10-concurrency Lambda cap. Per-route override: `history` and
   `track` (heavier Flux) throttled tighter, ~5 req/s.

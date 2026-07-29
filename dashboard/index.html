@@ -255,8 +255,8 @@
 </main>
 
 <footer>
-  Sandbox dashboard — polls <code>/latest</code> every 3 s, history + GPS trail per selected
-  range. Geo-fencing controls land here next.
+  Sandbox dashboard — polls every 30 s (one bundled history query per refresh,
+  matching the pack's batch cadence). Geo-fencing controls land here next.
 </footer>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
@@ -268,6 +268,18 @@ const API  = "https://cfc04rjifh.execute-api.us-east-1.amazonaws.com";
 // =================================================
 // Selected pack — populated from GET /packs, remembered per browser
 let PACK = localStorage.getItem("helt_pack") || "SANDBOX-01";
+
+// liveness = telemetry freshness (90 s ≈ 3x the firmware's 30 s batch period)
+// — the retained status flag can be days old on a stable connection. A 1 s
+// local ticker keeps the age display and pill honest between 30 s polls.
+let lastUpdatedTs = null;
+function renderAge() {
+  const age = lastUpdatedTs ? Math.max(0, Math.round(Date.now() / 1000 - lastUpdatedTs)) : null;
+  const online = age != null && age < 90;
+  $("stateTxt").textContent = online ? "online" : "offline";
+  $("packPill").className = "pill " + (online ? "online" : "offline");
+  $("age").textContent = age != null ? `updated ${age} s ago` : "no data yet";
+}
 
 // Chart roster — extending the telemetry payload? See HANDOFF.md §7 for the
 // full dependency chain (publisher -> ingest Lambda -> IOx schema -> here).
@@ -489,15 +501,9 @@ async function pollLatest() {
   try {
     const d = await getJSON(`/packs/${PACK}/latest`);
     const t = d.telemetry || {};
-    // liveness = telemetry freshness (90 s ≈ 3x the firmware's 30 s batch
-    // period) — the retained status flag can be days old on a stable connection
-    const age = d.updated_ts ? Math.max(0, Math.round(Date.now() / 1000 - d.updated_ts)) : null;
-    const online = age != null && age < 90;
-
     $("pid").textContent = d.pack_id || PACK;
-    $("stateTxt").textContent = online ? "online" : "offline";
-    $("packPill").className = "pill " + (online ? "online" : "offline");
-    $("age").textContent = age != null ? `updated ${age} s ago` : "no data yet";
+    lastUpdatedTs = d.updated_ts || null;
+    renderAge();
 
     $("k_soc").textContent = fmt(t.soc_pct, 0);
     $("socMeter").style.width = `${Math.min(100, Math.max(0, t.soc_pct ?? 0))}%`;
@@ -531,10 +537,38 @@ async function pollLatest() {
   }
 }
 
+let bundledApi = true;   // flips off if the deployed Lambda predates /histories
+
+function applyBundle(series) {
+  for (const f of FIELDS) charts[f.key].draw(series[f.key] || []);
+  const lonByT = new Map((series.lon || []).map(p => [p.t, p.v]));
+  const pts = (series.lat || [])
+    .filter(p => lonByT.has(p.t))
+    .map(p => [p.v, lonByT.get(p.t)]);
+  trail.setLatLngs(pts);
+  if (pts.length && !mapFitted) {
+    map.fitBounds(trail.getBounds(), { maxZoom: 16, padding: [30, 30] });
+    mapFitted = true;
+  }
+}
+
 async function refreshHistory() {
   $("charts").classList.add("loading");
   const failed = [];
   try {
+    // preferred: every field + the GPS trail in ONE API call (one InfluxDB
+    // query server-side — the query bill is the dominant cost)
+    if (bundledApi) {
+      try {
+        const h = await getJSON(`/packs/${PACK}/histories?range=${range}`);
+        applyBundle(h.series || {});
+        return;
+      } catch (e) {
+        if (String(e.message).includes("404")) { bundledApi = false; }  // old Lambda deployed
+        else { failed.push("histories"); console.warn("histories:", e); return; }
+      }
+    }
+    // legacy path (pre-/histories Lambda): one call per field + track.
     // on a failed fetch: keep the previous render (never fake "no data"),
     // report the field in the error strip, and let the next refresh retry
     const jobs = FIELDS.map(f => () =>
@@ -581,14 +615,19 @@ $("packSel").addEventListener("change", () => {
   for (const f of FIELDS) charts[f.key].draw([]);   // new context — clear, don't blend
   trail.setLatLngs([]);
   mapFitted = false;                                // re-center on the new pack
+  lastUpdatedTs = null;
   pollLatest();
   refreshHistory();
 });
 
 loadPacks().then(() => { pollLatest(); refreshHistory(); });
-setInterval(pollLatest, 3000);
+// 30 s poll matches the pack's batch cadence and the server-side response
+// cache — faster polling only re-reads the same cached answer (see
+// API_SECURITY_SPEC.md §5); the 1 s ticker keeps the age display live.
+setInterval(pollLatest, 30000);
 setInterval(refreshHistory, 30000);
 setInterval(loadPacks, 60000);
+setInterval(renderAge, 1000);
 </script>
 </body>
 </html>

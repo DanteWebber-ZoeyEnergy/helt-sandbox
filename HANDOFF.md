@@ -160,7 +160,7 @@ helt-sandbox/
 ├── aws/teardown.sh              # deletes everything
 ├── aws/config.env               # GIT-IGNORED: region, account, tokens, IDs
 ├── aws/sandbox_iot_policy.json  # permissive SANDBOX-ONLY policy
-├── dashboard/index.html         # static dashboard, polls the API every 3s
+├── dashboard/index.html         # static dashboard, polls the API every 30s
 └── README.md                    # full setup walkthrough
 ```
 
@@ -192,11 +192,22 @@ per pack. Runs from any machine with Python + the cert files: see
 - `GET /packs` → `{packs:[{pack_id, online, last_seen},...]}` (packs seen in
   last 7d; becomes the entitlement-filtered list in spec phase S2)
 - `GET /packs/{pack_id}/latest` → `{pack_id, updated_ts, telemetry:{...}, status:{...}}`
+  (`status` is `{}` unless `?status=1` — costs a second InfluxDB query and
+  liveness derives from telemetry freshness now)
+- `GET /packs/{pack_id}/histories?range=1h` → `{series:{field:[{t,v},...],…}}`
+  — every field + GPS in ONE InfluxDB query; the dashboard's refresh path
 - `GET /packs/{pack_id}/history?field=soc_pct&range=1h` → `{series:[{t,v},...]}`
   (`range` ∈ 15m, 1h, 6h, 24h, 7d; ranges beyond 15m are server-side
   downsampled via `aggregateWindow` mean to keep any range at ~200–400 points)
 - `GET /packs/{pack_id}/track?range=1h` → `{series:[{t,lat,lon},...]}` — GPS
   trail for the map (lat/lon pivoted into pairs, same downsampling)
+
+All query-Lambda responses are cached in-container for 30 s so N viewers share
+one InfluxDB query per window — query executions are the dominant variable
+cost (measured ≈$0.44/hr per open tab before; ≈$0.036/hr after; the fixed
+pipeline is ≈$10.7/mo at the 5-pack sandbox rate — see API_SECURITY_SPEC.md §5).
+The dashboard polls every 30 s to match, with a 404-triggered fallback to the
+old per-field endpoints so Pages deploys never race Lambda deploys.
 
 **To run it:** `source aws/config.env`, start the publisher with the four cert
 flags (see README §2), then `cd dashboard && python3 -m http.server 8000`.

@@ -8,11 +8,19 @@ Fronted by an API Gateway HTTP API (quick-create $default route). Routes:
         (becomes the entitlement-filtered list in API_SECURITY_SPEC.md S2)
     GET /packs/{pack_id}/latest
         -> latest value of every telemetry field + latest pack_status
+    GET /packs/{pack_id}/histories?range=1h
+        -> { series: { field: [{t,v},...], ... } } EVERY field in ONE
+        InfluxDB query (the dashboard's refresh path -- 1 query instead of 10)
     GET /packs/{pack_id}/history?field=soc_pct&range=1h
         -> [{ "t": <epoch_s>, "v": <number> }, ...] for one field
         (ranges beyond 15m are server-side downsampled via aggregateWindow)
     GET /packs/{pack_id}/track?range=1h
         -> [{ "t": <epoch_s>, "lat": <deg>, "lon": <deg> }, ...] GPS trail
+
+All responses are cached in-container for CACHE_TTL_S so concurrent viewers
+share one InfluxDB query per window -- query executions are the dominant cost
+(see API_SECURITY_SPEC.md §5). /latest omits the pack_status sub-query unless
+?status=1 (the dashboard derives liveness from telemetry freshness instead).
 
 Environment variables:
     INFLUXDB_URL        -- e.g. https://us-east-1-1.aws.cloud2.influxdata.com
@@ -46,6 +54,26 @@ RANGES = {
     "24h": ("-24h", "5m"),
     "7d":  ("-7d",  "30m"),
 }
+
+# Per-container response cache. InfluxDB bills per query execution ($0.012/100)
+# which dwarfs every other per-request cost, so N viewers polling the same pack
+# must share one query per TTL window. Containers each hold their own cache;
+# at sandbox traffic there are 1-2 warm containers, which is close enough.
+CACHE_TTL_S = 30
+_cache = {}
+
+
+def cached(key, fn):
+    now = time.time()
+    hit = _cache.get(key)
+    if hit and hit[0] > now:
+        return hit[1]
+    val = fn()
+    _cache[key] = (now + CACHE_TTL_S, val)
+    if len(_cache) > 256:                      # bound the container's memory
+        for k in [k for k, v in _cache.items() if v[0] <= now]:
+            _cache.pop(k, None)
+    return val
 
 
 def reply(code, body):
@@ -108,7 +136,7 @@ def get_packs():
     return reply(200, {"packs": packs})
 
 
-def get_latest(pack_id):
+def get_latest(pack_id, include_status=False):
     flux = (
         f'from(bucket:"{BUCKET}")'
         f'|> range(start:-15m)'
@@ -123,23 +151,48 @@ def get_latest(pack_id):
             telemetry[f] = _num(v)
         newest = max(newest, _iso_to_epoch(r.get("_time", "")))
 
-    # 30d lookback: the retained status is event-driven, so on a stable
-    # connection the newest row can legitimately be days old (a real drop
-    # still writes a fresh online:false via the LWT immediately)
-    flux_status = (
-        f'from(bucket:"{BUCKET}")'
-        f'|> range(start:-30d)'
-        f'|> filter(fn:(r)=> r._measurement=="pack_status" and r.pack_id=="{pack_id}")'
-        f'|> last()'
-    )
+    # status costs a second InfluxDB query and liveness now comes from
+    # telemetry freshness, so it's opt-in (?status=1). 30d lookback: the
+    # retained status is event-driven, so on a stable connection the newest
+    # row can legitimately be days old (a real drop still writes a fresh
+    # online:false via the LWT immediately).
     status = {}
-    for r in influx_query(flux_status):
-        f, v = r.get("_field"), r.get("_value")
-        if f and v not in (None, ""):
-            status[f] = _num(v)
+    if include_status:
+        flux_status = (
+            f'from(bucket:"{BUCKET}")'
+            f'|> range(start:-30d)'
+            f'|> filter(fn:(r)=> r._measurement=="pack_status" and r.pack_id=="{pack_id}")'
+            f'|> last()'
+        )
+        for r in influx_query(flux_status):
+            f, v = r.get("_field"), r.get("_value")
+            if f and v not in (None, ""):
+                status[f] = _num(v)
 
     return reply(200, {"pack_id": pack_id, "updated_ts": newest,
                        "telemetry": telemetry, "status": status})
+
+
+def get_histories(pack_id, rng):
+    """Every telemetry field for one pack in ONE Flux query -- replaces the
+    dashboard's 9 history + 1 track calls per refresh."""
+    start, every = RANGES.get(rng, RANGES["1h"])
+    agg = f'|> aggregateWindow(every:{every}, fn:mean, createEmpty:false)' if every else ''
+    flux = (
+        f'from(bucket:"{BUCKET}")'
+        f'|> range(start:{start})'
+        f'|> filter(fn:(r)=> r._measurement=="telemetry" and r.pack_id=="{pack_id}")'
+        f'{agg}'
+        f'|> keep(columns:["_time","_field","_value"])'
+    )
+    series = {}
+    for r in influx_query(flux):
+        f, v, t = r.get("_field"), r.get("_value"), r.get("_time")
+        if f and t and v not in (None, ""):
+            series.setdefault(f, []).append({"t": _iso_to_epoch(t), "v": _num(v)})
+    for pts in series.values():
+        pts.sort(key=lambda p: p["t"])
+    return reply(200, {"pack_id": pack_id, "range": rng, "series": series})
 
 
 def get_history(pack_id, field, rng):
@@ -189,20 +242,29 @@ def lambda_handler(event, context):
 
     segs = [s for s in path.split("/") if s]
     if len(segs) == 1 and segs[0] == "packs":
-        return get_packs()
+        return cached(("packs",), get_packs)
     # expected: packs / {pack_id} / {kind}
     if len(segs) >= 3 and segs[0] == "packs":
         pack_id, kind = segs[1], segs[2]
         if not SAFE.match(pack_id):
             return reply(400, {"error": "invalid pack_id"})
+        rng = q.get("range", "1h")
         if kind == "latest":
-            return get_latest(pack_id)
+            inc = q.get("status") == "1"
+            return cached(("latest", pack_id, inc),
+                          lambda: get_latest(pack_id, inc))
+        if kind == "histories":
+            return cached(("histories", pack_id, rng),
+                          lambda: get_histories(pack_id, rng))
         if kind == "history":
-            return get_history(pack_id, q.get("field", "soc_pct"), q.get("range", "1h"))
+            field = q.get("field", "soc_pct")
+            return cached(("history", pack_id, field, rng),
+                          lambda: get_history(pack_id, field, rng))
         if kind == "track":
-            return get_track(pack_id, q.get("range", "1h"))
+            return cached(("track", pack_id, rng),
+                          lambda: get_track(pack_id, rng))
     return reply(404, {"error": "not found",
-                       "hint": "GET /packs/{id}/latest | /packs/{id}/history?field=..&range=1h | /packs/{id}/track?range=1h"})
+                       "hint": "GET /packs | /packs/{id}/latest | /packs/{id}/histories?range=1h | /packs/{id}/history?field=..&range=1h | /packs/{id}/track?range=1h"})
 
 
 def _num(v):
