@@ -41,7 +41,12 @@ aws iot delete-policy --policy-name "$IOT_POLICY" --region "$REGION" 2>/dev/null
 aws iot delete-thing --thing-name "$IOT_THING" --region "$REGION" 2>/dev/null \
   && echo "deleted thing $IOT_THING"
 
+# DynamoDB entitlements
+aws dynamodb delete-table --table-name helt_entitlements --region "$REGION" 2>/dev/null >/dev/null \
+  && echo "deleted table helt_entitlements"
+
 # IAM role
+aws iam delete-role-policy --role-name "$LAMBDA_ROLE" --policy-name entitlements-read 2>/dev/null
 aws iam detach-role-policy --role-name "$LAMBDA_ROLE" \
   --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole 2>/dev/null
 aws iam delete-role --role-name "$LAMBDA_ROLE" 2>/dev/null && echo "deleted role $LAMBDA_ROLE"
