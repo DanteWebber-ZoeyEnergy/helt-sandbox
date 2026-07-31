@@ -130,6 +130,33 @@
   .pack-marker { width: 14px; height: 14px; border-radius: 50%; background: var(--red);
                  border: 3px solid #fff; box-shadow: 0 0 0 1px var(--hairline); }
 
+  /* ---- login gate (spec S1 — a gate, not the future login UX) ---- */
+  .login { position: fixed; inset: 0; z-index: 2000; background: var(--page);
+           display: flex; align-items: center; justify-content: center; }
+  .login[hidden] { display: none; }
+  .login-card { background: var(--surface); border: 1px solid var(--hairline);
+                border-radius: var(--radius); padding: 2rem 2.2rem;
+                width: min(360px, 92vw); }
+  .login-card .logo { margin-bottom: 1.2rem; }
+  .login-card h2 { margin: 0; font-size: 1.5rem; }
+  .login-card label { display: block; font-size: .75rem; text-transform: uppercase;
+                      letter-spacing: .08em; color: var(--ink-2); margin: 1rem 0 .3rem; }
+  .login-card input { width: 100%; font: 400 .95rem Roboto, Arial, sans-serif;
+                      color: var(--ink); border: 1px solid var(--hairline);
+                      border-radius: 8px; padding: .55rem .7rem; background: var(--surface); }
+  .login-card input:focus { outline: 2px solid var(--red); outline-offset: 1px; }
+  .login-card button { margin-top: 1.4rem; width: 100%; border: 0; border-radius: 8px;
+                       cursor: pointer; background: var(--red); color: #fff;
+                       font-size: 1.1rem; padding: .55rem; }
+  .login-card button:hover { background: var(--red-dk); }
+  .login-card .login-err { color: var(--red-dk); font-size: .85rem;
+                           min-height: 1.2em; margin-top: .8rem; }
+  .signout { font: 500 .8rem Roboto, Arial, sans-serif; color: var(--ink-2);
+             background: none; border: 1px solid var(--hairline); border-radius: 999px;
+             padding: .3rem .8rem; cursor: pointer; }
+  .signout:hover { color: var(--red-dk); border-color: var(--red); }
+  .whoami { font-size: .8rem; color: var(--muted); }
+
   .err { color: var(--red-dk); font-size: .85rem; margin-top: 1rem; min-height: 1.2em; }
   footer { max-width: 1180px; margin: 0 auto; padding: 0 1.5rem 2rem;
            color: var(--muted); font-size: .8rem; }
@@ -143,7 +170,7 @@
     <!-- official HELT logotype (Graphics/helt_logo.svg), recolored to the
          brand-guide HELT Blue #333E48 via currentColor -->
     <div class="logo" aria-label="HELT"><svg viewBox="0 0 1280 413" role="img" xmlns="http://www.w3.org/2000/svg">
-      <path fill="currentColor" d="M 60.20,76.70
+      <path id="helt-logo-path" fill="currentColor" d="M 60.20,76.70
            C 60.20,76.70 84.46,52.34 84.46,52.34
              84.46,52.34 150.83,52.26 150.83,52.26
              150.83,52.26 151.89,164.07 151.89,164.07
@@ -209,7 +236,25 @@
   <select class="packsel" id="packSel" aria-label="Select pack"></select>
   <span class="pill" id="packPill"><span class="dot"></span><span id="pid">—</span>&nbsp;<span id="stateTxt">connecting…</span></span>
   <span class="updated" id="age">updated: never</span>
+  <span class="whoami" id="whoami"></span>
+  <button class="signout" id="signout" hidden>Sign out</button>
 </header>
+
+<!-- login gate: shown until a Cognito session exists (sessionStorage) -->
+<div class="login" id="login">
+  <form class="login-card" id="loginForm">
+    <div class="logo" aria-hidden="true"><svg viewBox="0 0 1280 413" xmlns="http://www.w3.org/2000/svg">
+      <use href="#helt-logo-path"/>
+    </svg></div>
+    <h2>Sign in</h2>
+    <label for="loginEmail">Email</label>
+    <input id="loginEmail" type="email" autocomplete="username" required>
+    <label for="loginPass">Password</label>
+    <input id="loginPass" type="password" autocomplete="current-password" required>
+    <button class="btnish" type="submit" id="loginBtn">Sign in</button>
+    <div class="login-err" id="loginErr"></div>
+  </form>
+</div>
 
 <main>
   <section class="kpis">
@@ -265,7 +310,79 @@
 // ================== CONFIGURE ME ==================
 // Paste the API base URL that setup.sh (step 6) printed, no trailing slash:
 const API  = "https://cfc04rjifh.execute-api.us-east-1.amazonaws.com";
+// Cognito (setup.sh step 7 → aws/config.env). The client id is public by
+// design (a no-secret app client); possession of it grants nothing.
+const COGNITO_REGION    = "us-east-1";
+const COGNITO_CLIENT_ID = "PASTE_COGNITO_CLIENT_ID";
 // =================================================
+
+/* ------------------------- auth (spec S1) --------------------------------
+   Minimal gate: email+password -> Cognito InitiateAuth (USER_PASSWORD_AUTH),
+   1 h access token auto-refreshed while the tab is open. Tokens live in
+   sessionStorage (per-tab, gone on close). NOT the future login UX. */
+const IDP_URL = `https://cognito-idp.${COGNITO_REGION}.amazonaws.com/`;
+async function idp(target, body) {
+  const r = await fetch(IDP_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-amz-json-1.1",
+               "X-Amz-Target": `AWSCognitoIdentityProviderService.${target}` },
+    body: JSON.stringify(body),
+  });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(d.message || d.__type || `auth error ${r.status}`);
+  return d;
+}
+let auth = JSON.parse(sessionStorage.getItem("helt_auth") || "null");
+function saveAuth(a) {
+  auth = a;
+  if (a) sessionStorage.setItem("helt_auth", JSON.stringify(a));
+  else sessionStorage.removeItem("helt_auth");
+}
+async function login(email, password) {
+  const d = await idp("InitiateAuth", {
+    AuthFlow: "USER_PASSWORD_AUTH", ClientId: COGNITO_CLIENT_ID,
+    AuthParameters: { USERNAME: email, PASSWORD: password },
+  });
+  const r = d.AuthenticationResult;
+  saveAuth({ access: r.AccessToken, refresh: r.RefreshToken,
+             exp: Date.now() + r.ExpiresIn * 1000, email });
+}
+let refreshing = null;                    // single-flight: pollers share one refresh
+function refreshAuth() {
+  refreshing ??= idp("InitiateAuth", {
+    AuthFlow: "REFRESH_TOKEN_AUTH", ClientId: COGNITO_CLIENT_ID,
+    AuthParameters: { REFRESH_TOKEN: auth.refresh },
+  }).then(d => {
+    const r = d.AuthenticationResult;
+    saveAuth({ ...auth, access: r.AccessToken, exp: Date.now() + r.ExpiresIn * 1000 });
+  }).catch(e => { signOut(true); throw e; })
+    .finally(() => { refreshing = null; });
+  return refreshing;
+}
+async function token() {
+  if (!auth) throw new Error("signed out");
+  if (Date.now() > auth.exp - 5 * 60 * 1000) await refreshAuth();
+  return auth.access;
+}
+async function signOut(localOnly) {
+  const a = auth;
+  saveAuth(null);
+  showLogin();
+  if (!localOnly && a) {                  // best-effort server-side revoke
+    try { await idp("GlobalSignOut", { AccessToken: a.access }); } catch {}
+  }
+}
+function showLogin() {
+  $("login").hidden = false;
+  $("signout").hidden = true;
+  $("whoami").textContent = "";
+}
+function startData() {
+  $("login").hidden = true;
+  $("signout").hidden = false;
+  $("whoami").textContent = auth.email || "";
+  loadPacks().then(() => { pollLatest(); refreshHistory(); });
+}
 // Selected pack — populated from GET /packs, remembered per browser
 let PACK = localStorage.getItem("helt_pack") || "SANDBOX-01";
 
@@ -477,12 +594,24 @@ const marker = L.marker([-33.9249, 18.4241],
   { icon: L.divIcon({ className: "", html: '<div class="pack-marker"></div>',
                       iconSize: [14, 14], iconAnchor: [7, 7] }) }).addTo(map);
 let mapFitted = false;
+const mapCard = document.querySelector(".map-card");
+function setMapVisible(v) {
+  const was = mapCard.style.display !== "none";
+  mapCard.style.display = v ? "" : "none";
+  if (v && !was) setTimeout(() => map.invalidateSize(), 0);  // Leaflet re-measure
+}
 
 /* ------------------------------- data flow ------------------------------- */
 async function getJSON(path, tries = 2) {
   for (let i = 1; ; i++) {
-    const r = await fetch(`${API}${path}`);
+    const r = await fetch(`${API}${path}`,
+      { headers: { Authorization: `Bearer ${await token()}` } });
     if (r.ok) return r.json();
+    if (r.status === 401 && i < tries) {   // stale token: refresh, then retry
+      await refreshAuth();
+      continue;
+    }
+    if (r.status === 403) throw new Error(`403 not entitled: ${path}`);
     if (i >= tries) throw new Error(`API ${r.status} on ${path}`);
     await new Promise(res => setTimeout(res, 400 * i));   // brief backoff, then retry
   }
@@ -498,6 +627,7 @@ async function pool(thunks, width) {
 }
 
 async function pollLatest() {
+  if (!auth) return;
   try {
     const d = await getJSON(`/packs/${PACK}/latest`);
     const t = d.telemetry || {};
@@ -524,6 +654,8 @@ async function pollLatest() {
       n.appendChild(u);
     }
 
+    // no lat/lon = no location entitlement (or no GPS data): hide the map
+    setMapVisible(t.lat != null && t.lon != null);
     if (t.lat != null && t.lon != null) {
       marker.setLatLng([t.lat, t.lon]);
       $("coords").textContent =
@@ -553,6 +685,7 @@ function applyBundle(series) {
 }
 
 async function refreshHistory() {
+  if (!auth) return;
   $("charts").classList.add("loading");
   const failed = [];
   try {
@@ -593,6 +726,7 @@ async function refreshHistory() {
 }
 
 async function loadPacks() {
+  if (!auth) return;
   try {
     const d = await getJSON("/packs");
     const packs = d.packs || [];
@@ -620,10 +754,27 @@ $("packSel").addEventListener("change", () => {
   refreshHistory();
 });
 
-loadPacks().then(() => { pollLatest(); refreshHistory(); });
+$("loginForm").addEventListener("submit", async e => {
+  e.preventDefault();
+  $("loginBtn").disabled = true;
+  $("loginErr").textContent = "";
+  try {
+    await login($("loginEmail").value.trim(), $("loginPass").value);
+    $("loginPass").value = "";
+    startData();
+  } catch (err) {
+    $("loginErr").textContent = "⚠ " + err.message;
+  } finally {
+    $("loginBtn").disabled = false;
+  }
+});
+$("signout").addEventListener("click", () => signOut(false));
+
+if (auth) startData(); else showLogin();
 // 30 s poll matches the pack's batch cadence and the server-side response
 // cache — faster polling only re-reads the same cached answer (see
 // API_SECURITY_SPEC.md §5); the 1 s ticker keeps the age display live.
+// All pollers no-op while signed out.
 setInterval(pollLatest, 30000);
 setInterval(refreshHistory, 30000);
 setInterval(loadPacks, 60000);
