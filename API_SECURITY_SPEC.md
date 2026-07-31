@@ -1,7 +1,10 @@
 # HELT Customer API — Access & Security Specification
 
-**Status: v0.1 — DRAFT FOR REVIEW. No auth code gets written until this is
-approved** (per the piece-C ground rule: design first).
+**Status: v0.2 — APPROVED 2026-07-31.** The five §10 questions are answered
+(decisions recorded in §10). One design change from v0.1: the **Hosted UI
+login page is deferred** — there is a single customer for now, who receives
+credentials in a document and fetches tokens by script (§2). S1–S2
+implementation lives in this repo.
 
 Companion to `HANDOFF.md` §6 (API-first decision, settled). This document
 specifies how the currently wide-open sandbox API becomes the real
@@ -34,24 +37,36 @@ real commands exist yet — revisit when they do), OTA, fleet provisioning.
 
 ## 2. Authentication — Amazon Cognito User Pool
 
-**Decision (proposed): one Cognito User Pool** (`helt-users`, us-east-1).
+**Decision: one Cognito User Pool** (`helt-users`, us-east-1), email as the
+sign-in identifier. Self-signup **disabled**: users are created by us
+(admin-create), because a pack entitlement has to exist anyway before an
+account is useful.
 
-- **Humans (dashboard):** email + password login against the pool. The
-  dashboard uses the **Cognito Hosted UI** (OAuth2 authorization-code + PKCE
-  redirect) rather than an embedded login form — zero password handling in our
-  code, MFA/forgot-password/lockout come free, and the UI is CSS-brandable
-  (HELT logo + colors). Self-signup **disabled**: users are created by us
-  (admin-create), because a pack entitlement has to exist anyway before an
-  account is useful.
-- **Machines (business customers, later phase):** a *machine user* in the same
-  pool using the client-credentials-style flow (an app client with its own
-  secret, no Hosted UI). It produces the same shape of JWT, so the entire
-  authorization path below is identical — this is the "both credential types
-  converge on one check" requirement. Standalone API keys (REST-API usage
-  plans) are deliberately **not** chosen; see §6 and Appendix A.
-- **Tokens:** access token, 1 h expiry; refresh token 30 d. The dashboard
-  sends `Authorization: Bearer <access_token>`. Never in query strings.
+- **Now (single-customer phase): headless users, no login page.** Every
+  credential — the customer's and our internal dashboard account — is a
+  normal pool user. The customer receives a document (see
+  `API_ACCESS.md`) containing their email + password + a ~10-line snippet
+  that exchanges those for a 1 h access token via Cognito's `InitiateAuth`
+  API (`USER_PASSWORD_AUTH` flow, public app client, no secret). A 24/7
+  poller re-fetches a token once an hour — one extra HTTPS call. This *is*
+  the machine flow: no separate credential type, so the one-authz-path rule
+  holds by construction.
+- **Deferred: Hosted UI login page.** When there are multiple human users, add
+  the Cognito Hosted UI (OAuth2 code + PKCE — zero password handling,
+  MFA/forgot-password free, CSS-brandable). Nothing migrates: the same user
+  accounts, same `sub`, same entitlement rows serve both flows.
+- **Rejected: dedicated M2M app client** (client-credentials): same effort for
+  the customer, but AWS bills M2M app clients (~$6/mo) and it creates a
+  second identity disconnected from any future dashboard login. Standalone
+  API keys (REST-API usage plans) also rejected; see §6 and Appendix A.
+- **Tokens:** access token, 1 h expiry; refresh token 30 d. Clients send
+  `Authorization: Bearer <access_token>`. Never in query strings.
   Logout = Cognito global sign-out (revokes refresh; access tokens die ≤1 h).
+- **Internal dashboard:** minimal in-page prompt (email + password →
+  `InitiateAuth` from the browser, ~40 lines, no redirect), signed in as the
+  internal ops user which is entitled to all packs. Tokens live in
+  sessionStorage, auto-refreshed while the tab is open. This is a gate, not
+  the future login UX.
 
 **Why Cognito:** managed + free at this scale (free tier ≈ 10k MAU), and API
 Gateway **HTTP APIs have a native JWT authorizer** — issuer/audience/signature/
@@ -119,7 +134,8 @@ table schema doesn't change when it arrives.
 ## 4. Request flow
 
 ```
-Browser ──login──▶ Cognito Hosted UI ──code+PKCE──▶ tokens (1h access / 30d refresh)
+Client (customer script / dashboard prompt)
+   ──email+password──▶ Cognito InitiateAuth ──▶ tokens (1h access / 30d refresh)
    │
    ▼  Authorization: Bearer <access_token>
 API Gateway (HTTP API)
@@ -226,10 +242,11 @@ env vars, sandbox IoT policy still permissive (ingest side, separate task).
 
 ## 9. Rollout phases (each is sandbox-runnable, each extends setup.sh/teardown.sh)
 
-- **S1 — Authentication + CORS:** create user pool + Hosted UI app client +
-  2 test users; attach JWT authorizer to explicit routes; lock CORS; dashboard
-  gets login (redirect flow), token storage in memory + refresh, and a
-  logged-out state. *Demo: unauthenticated curl → 401; login → data.*
+- **S1 — Authentication + CORS:** create user pool + public app client
+  (`USER_PASSWORD_AUTH`) + test users (internal ops + two fake customers);
+  attach JWT authorizer to explicit routes; lock CORS; dashboard gets the
+  minimal in-page prompt, sessionStorage tokens + hourly refresh, and a
+  logged-out state. *Demo: unauthenticated curl → 401; token → data.*
 - **S2 — Authorization:** `helt_entitlements` table + `grant.py`; Lambda
   enforcement (pack check, group filter, `/packs` filtering); audit lines.
   *Demo: user A sees SANDBOX-01..03; user B sees 04..05 without `location` —
@@ -241,17 +258,21 @@ env vars, sandbox IoT policy still permissive (ingest side, separate task).
 
 ---
 
-## 10. Open questions (need your call before S1 starts)
+## 10. Decisions (answered 2026-07-31)
 
-1. **Field groups** — are `core / health / location / ops` the right cuts, or
-   do you want per-field grants (more flexible, more admin fiddliness)?
-2. **Login UX** — Hosted UI redirect (proposed: fastest, zero password code,
-   brandable) vs. an embedded login form in the dashboard (prettier, more code,
-   we handle credentials in-page)?
-3. **Machine access (business customers)** — build the machine-user flow in
-   S3, or defer entirely until a real business customer exists?
-4. **Admin** — is `grant.py` CLI acceptable until an admin page is scheduled?
-5. **User creation** — confirm admin-create only (no self-signup) for now.
+1. **Field groups** — the four groups `core / health / location / ops` as
+   specced. Per-field grants rejected (admin fiddliness, and every new
+   telemetry field would touch entitlement rows).
+2. **Login UX** — **deferred entirely.** Single customer for now; they get
+   credentials in a document and fetch tokens by script (§2). The internal
+   dashboard gets a minimal in-page prompt — a gate, not the product login.
+   Hosted UI vs embedded form gets decided when multiple human users exist.
+3. **Machine access** — the headless-user flow shipped in S1 *is* machine
+   access; a dedicated M2M app client is rejected for now (AWS M2M billing,
+   ~$6/mo, and a second identity). Revisit only if a customer needs OAuth
+   client-credentials semantics specifically.
+4. **Admin** — `grant.py` CLI confirmed; admin web page explicitly later.
+5. **User creation** — admin-create only confirmed; self-signup stays off.
 
 ---
 
