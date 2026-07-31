@@ -216,12 +216,30 @@ step8() {  # JWT authorizer + explicit routes + CORS lockdown (spec §6, S1)
         --region "$REGION" >/dev/null && echo "route '$rk' updated (JWT required)"
     fi
   done
-  # the wide-open catch-all must go: unknown paths now 404 at the gateway
-  defid=$(aws apigatewayv2 get-routes --api-id "$API_ID" --region "$REGION" \
-    --query 'Items[?RouteKey==`"$default"`].RouteId | [0]' --output text)
-  if [ "$defid" != "None" ] && [ -n "$defid" ]; then
-    aws apigatewayv2 delete-route --api-id "$API_ID" --route-id "$defid" \
-      --region "$REGION" && echo "\$default catch-all route deleted"
+  # Browser preflights carry no Authorization header, and the gateway only
+  # auto-answers OPTIONS when NO route matches -- $default always matches.
+  # So preflights need an explicit unauthenticated OPTIONS route; the Lambda
+  # answers 200 {} and the gateway stamps the CORS headers (found live
+  # 2026-07-31: JWT on $default was 401-ing preflights, killing all fetches).
+  rid=$(aws apigatewayv2 get-routes --api-id "$API_ID" --region "$REGION" \
+    --query "Items[?RouteKey=='OPTIONS /{proxy+}'].RouteId | [0]" --output text)
+  if [ "$rid" = "None" ] || [ -z "$rid" ]; then
+    aws apigatewayv2 create-route --api-id "$API_ID" \
+      --route-key "OPTIONS /{proxy+}" --target "integrations/$integ" \
+      --region "$REGION" >/dev/null && echo "route 'OPTIONS /{proxy+}' created (no auth: preflights only)"
+  else
+    echo "route 'OPTIONS /{proxy+}' exists"
+  fi
+  # quick-create's $default route is ApiGatewayManaged and CANNOT be deleted
+  # (delete-route returns 200 but the route survives -- found live 2026-07-31).
+  # Lock it behind the JWT authorizer instead: zero anonymous surface, and
+  # unknown paths 404 inside the Lambda for authenticated callers only.
+  defid=$(aws apigatewayv2 get-routes --api-id "$API_ID" --region "$REGION" --output json \
+    | python3 -c 'import json,sys; ids=[i["RouteId"] for i in json.load(sys.stdin)["Items"] if i["RouteKey"]=="$default"]; print(ids[0] if ids else "")')
+  if [ -n "$defid" ]; then
+    aws apigatewayv2 update-route --api-id "$API_ID" --route-id "$defid" \
+      --authorization-type JWT --authorizer-id "$auth_id" --region "$REGION" >/dev/null \
+      && echo "\$default catch-all locked behind the JWT authorizer"
   fi
   aws apigatewayv2 update-api --api-id "$API_ID" --cors-configuration \
     '{"AllowOrigins":["https://dantewebber-zoeyenergy.github.io","http://localhost:8000"],"AllowMethods":["GET","OPTIONS"],"AllowHeaders":["authorization","content-type"],"MaxAge":3600}' \

@@ -198,10 +198,14 @@ Net effect: ~5 InfluxDB queries/min per active pack view (~$0.036/hour,
   `Access-Control-Allow-Origin` = exactly the dashboard origins (the
   github.io origin + `http://localhost:8000` for dev), methods `GET,OPTIONS`,
   headers `Authorization,Content-Type`, max-age 3600.
-- Explicit routes replace the `$default` catch-all, each with the JWT
-  authorizer attached: `GET /packs`, `GET /packs/{pack_id}/latest`,
-  `GET /packs/{pack_id}/history`, `GET /packs/{pack_id}/track`. Anything else
-  404s at the gateway without invoking Lambda.
+- Explicit routes, each with the JWT authorizer attached: `GET /packs`,
+  `GET /packs/{pack_id}/latest`, `GET /packs/{pack_id}/histories`,
+  `GET /packs/{pack_id}/history`, `GET /packs/{pack_id}/track`.
+  The quick-create `$default` catch-all is **ApiGatewayManaged and cannot be
+  deleted** (learned live, S1): it too gets the JWT authorizer, so unknown
+  paths are 401 anonymously and 404 (in the Lambda) for authenticated
+  callers. The Lambda independently refuses any request arriving without
+  JWT claims — defence against exactly this kind of route drift.
 - TLS is API Gateway default; custom domain (`api.helt.co.za`) + CloudFront
   is future polish, not security-relevant now.
 - Error shape everywhere: `{"error": "<machine_code>", "detail": "<human>"}`.
