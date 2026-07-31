@@ -122,6 +122,112 @@ step6() {  # HTTP API in front of the query Lambda (quick-create adds route+perm
   echo "    curl \"$endpoint/packs/${PACK_ID}/latest\""
 }
 
-all() { step1; step2; step3; step4; step5; step6; banner "DONE"; }
+step7() {  # Cognito user pool + app client + headless users (spec §2, S1)
+  banner "STEP 7  Cognito user pool"
+  if [ -n "${COGNITO_POOL_ID:-}" ] && aws cognito-idp describe-user-pool \
+       --user-pool-id "$COGNITO_POOL_ID" --region "$REGION" >/dev/null 2>&1; then
+    echo "pool $COGNITO_POOL_ID already exists -- skipping create"
+  else
+    COGNITO_POOL_ID=$(aws cognito-idp create-user-pool --pool-name helt-users \
+      --username-attributes email \
+      --admin-create-user-config AllowAdminCreateUserOnly=true \
+      --policies 'PasswordPolicy={MinimumLength=12,RequireUppercase=true,RequireLowercase=true,RequireNumbers=true,RequireSymbols=true}' \
+      --region "$REGION" --query UserPool.Id --output text)
+    echo "pool created: $COGNITO_POOL_ID"
+    sed -i.bak "s|^export COGNITO_POOL_ID=.*|export COGNITO_POOL_ID=$COGNITO_POOL_ID|" config.env
+    rm -f config.env.bak
+  fi
+  if [ -n "${COGNITO_CLIENT_ID:-}" ] && aws cognito-idp describe-user-pool-client \
+       --user-pool-id "$COGNITO_POOL_ID" --client-id "$COGNITO_CLIENT_ID" \
+       --region "$REGION" >/dev/null 2>&1; then
+    echo "app client $COGNITO_CLIENT_ID already exists -- skipping create"
+  else
+    # public client (no secret): the client id ships in the dashboard HTML and
+    # the customer doc; USER_PASSWORD_AUTH is the headless token-fetch flow.
+    COGNITO_CLIENT_ID=$(aws cognito-idp create-user-pool-client \
+      --user-pool-id "$COGNITO_POOL_ID" --client-name helt-api-client \
+      --no-generate-secret \
+      --explicit-auth-flows ALLOW_USER_PASSWORD_AUTH ALLOW_REFRESH_TOKEN_AUTH \
+      --prevent-user-existence-errors ENABLED \
+      --region "$REGION" --query UserPoolClient.ClientId --output text)
+    echo "app client created: $COGNITO_CLIENT_ID"
+    sed -i.bak "s|^export COGNITO_CLIENT_ID=.*|export COGNITO_CLIENT_ID=$COGNITO_CLIENT_ID|" config.env
+    rm -f config.env.bak
+  fi
+  # three headless users: internal ops + two fake customers (the S2 demo pair).
+  # Passwords are generated once and persisted into git-ignored config.env.
+  local u email_var pass_var email pass
+  for u in OPS CUSTA CUSTB; do
+    email_var="COGNITO_${u}_EMAIL"; pass_var="COGNITO_${u}_PASSWORD"
+    email="${!email_var}"; pass="${!pass_var}"
+    if [ -z "$pass" ]; then
+      pass="Helt#1-$(openssl rand -hex 6)"
+      sed -i.bak "s|^export ${pass_var}=.*|export ${pass_var}=$pass|" config.env
+      rm -f config.env.bak
+    fi
+    if aws cognito-idp admin-get-user --user-pool-id "$COGNITO_POOL_ID" \
+         --username "$email" --region "$REGION" >/dev/null 2>&1; then
+      echo "user $email already exists"
+    else
+      aws cognito-idp admin-create-user --user-pool-id "$COGNITO_POOL_ID" \
+        --username "$email" \
+        --user-attributes Name=email,Value="$email" Name=email_verified,Value=true \
+        --message-action SUPPRESS --region "$REGION" >/dev/null
+      aws cognito-idp admin-set-user-password --user-pool-id "$COGNITO_POOL_ID" \
+        --username "$email" --password "$pass" --permanent --region "$REGION"
+      echo "user $email created (password persisted to config.env)"
+    fi
+  done
+}
+
+step8() {  # JWT authorizer + explicit routes + CORS lockdown (spec §6, S1)
+  banner "STEP 8  API auth routes + CORS"
+  local issuer="https://cognito-idp.${REGION}.amazonaws.com/${COGNITO_POOL_ID}"
+  local auth_id integ rid defid rk
+  auth_id=$(aws apigatewayv2 get-authorizers --api-id "$API_ID" --region "$REGION" \
+    --query "Items[?Name=='helt-jwt'].AuthorizerId | [0]" --output text)
+  if [ "$auth_id" = "None" ] || [ -z "$auth_id" ]; then
+    auth_id=$(aws apigatewayv2 create-authorizer --api-id "$API_ID" \
+      --authorizer-type JWT --name helt-jwt \
+      --identity-source '$request.header.Authorization' \
+      --jwt-configuration "Audience=$COGNITO_CLIENT_ID,Issuer=$issuer" \
+      --region "$REGION" --query AuthorizerId --output text)
+    echo "JWT authorizer created: $auth_id"
+  else
+    echo "JWT authorizer exists: $auth_id"
+  fi
+  # reuse the Lambda-proxy integration that quick-create made for $default
+  integ=$(aws apigatewayv2 get-integrations --api-id "$API_ID" --region "$REGION" \
+    --query "Items[0].IntegrationId" --output text)
+  for rk in "GET /packs" "GET /packs/{pack_id}/latest" \
+            "GET /packs/{pack_id}/histories" "GET /packs/{pack_id}/history" \
+            "GET /packs/{pack_id}/track"; do
+    rid=$(aws apigatewayv2 get-routes --api-id "$API_ID" --region "$REGION" \
+      --query "Items[?RouteKey=='$rk'].RouteId | [0]" --output text)
+    if [ "$rid" = "None" ] || [ -z "$rid" ]; then
+      aws apigatewayv2 create-route --api-id "$API_ID" --route-key "$rk" \
+        --target "integrations/$integ" \
+        --authorization-type JWT --authorizer-id "$auth_id" \
+        --region "$REGION" >/dev/null && echo "route '$rk' created (JWT required)"
+    else
+      aws apigatewayv2 update-route --api-id "$API_ID" --route-id "$rid" \
+        --target "integrations/$integ" \
+        --authorization-type JWT --authorizer-id "$auth_id" \
+        --region "$REGION" >/dev/null && echo "route '$rk' updated (JWT required)"
+    fi
+  done
+  # the wide-open catch-all must go: unknown paths now 404 at the gateway
+  defid=$(aws apigatewayv2 get-routes --api-id "$API_ID" --region "$REGION" \
+    --query 'Items[?RouteKey==`"$default"`].RouteId | [0]' --output text)
+  if [ "$defid" != "None" ] && [ -n "$defid" ]; then
+    aws apigatewayv2 delete-route --api-id "$API_ID" --route-id "$defid" \
+      --region "$REGION" && echo "\$default catch-all route deleted"
+  fi
+  aws apigatewayv2 update-api --api-id "$API_ID" --cors-configuration \
+    '{"AllowOrigins":["https://dantewebber-zoeyenergy.github.io","http://localhost:8000"],"AllowMethods":["GET","OPTIONS"],"AllowHeaders":["authorization","content-type"],"MaxAge":3600}' \
+    --region "$REGION" >/dev/null && echo "CORS locked to the two dashboard origins"
+}
+
+all() { step1; step2; step3; step4; step5; step6; step7; step8; banner "DONE"; }
 
 "${1:-all}"

@@ -12,6 +12,11 @@ echo "Tearing down sandbox in $REGION ..."
 [ -n "${API_ID:-}" ] && aws apigatewayv2 delete-api --api-id "$API_ID" --region "$REGION" \
   && echo "deleted API $API_ID"
 
+# Cognito (removes the pool, its app client, and all users)
+[ -n "${COGNITO_POOL_ID:-}" ] && aws cognito-idp delete-user-pool \
+  --user-pool-id "$COGNITO_POOL_ID" --region "$REGION" 2>/dev/null \
+  && echo "deleted user pool $COGNITO_POOL_ID"
+
 # Lambdas
 aws lambda delete-function --function-name "$INGEST_FN" --region "$REGION" 2>/dev/null \
   && echo "deleted $INGEST_FN"
