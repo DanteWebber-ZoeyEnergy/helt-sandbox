@@ -296,17 +296,30 @@ open questions at the end need answers before S1 code starts.
 
 ---
 
-## 7. What the next chat is for
+## 7. Work status + what the next chat is for
 
-1. **Change the data the firmware publishes.** Note the dependency chain — a
-   payload change touches: the serializer in `main/cloud_sync.c` → the ingest
-   Lambda's three type-bucket loops (`u` / float / `i`) → `cloud/influxdb_schema.md`
-   → the dashboard's `FIELDS` array → possibly the query Lambda. **And** any new or
-   retyped field collides with the IOx locked schema in whichever bucket it lands.
-2. **Dashboard changes.**
-3. **API access and security** — design the real customer-facing API properly:
-   authentication, per-pack/per-field authorization, rate limiting, CORS lockdown
-   (currently `*`), and removing the sandbox's wide-open access.
+**Done (2026-07-24..27), sandbox-side:** payload expanded (soh_pct, cycle_count,
+lat/lon — see §4 schema-ahead note; the *firmware* serializer has NOT changed),
+realistic multi-pack simulation, dashboard rebuilt on the official brand with
+charts/map/pack-picker (live on GitHub Pages), query-cost fixes (30 s cache,
+bundled `/histories`, 30 s polling), freshness-based liveness.
+
+**Next: implement API security per `API_SECURITY_SPEC.md`** (Cognito + JWT
+authorizer + entitlements + CORS lockdown + throttling, phases S1–S3). The
+spec's §10 open questions need the user's answers before S1 code starts.
+Data flow stays pull-only for now — push delivery, a cursor/mirroring
+endpoint, and a DynamoDB latest-state table were analysed (see chat history
+2026-07-27ff) and deliberately deferred.
+
+**Payload dependency chain (for any future field change):** the serializer in
+`main/cloud_sync.c` (or `fake_pack.py` in sandbox) → the ingest Lambda's three
+type-bucket loops (`u` / float / `i`) → `cloud/influxdb_schema.md` → the
+dashboard's `FIELDS` array → possibly the query Lambda. **And** any new or
+retyped field collides with the IOx locked schema in whichever bucket it lands.
+
+**Also outstanding:** InfluxDB retention policy on `helt_sandbox` (storage
+grows ~0.35 GB/mo); firmware catch-up prerequisites in §4; the two firmware-repo
+items in §5.
 
 Constraints that still apply: firmware work follows the workflow rules in
 `CLAUDE.md` (verify APIs against local ESP-IDF sources, `idf.py build` at every
