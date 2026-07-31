@@ -187,10 +187,11 @@ per pack. Runs from any machine with Python + the cert files: see
 `publisher/WINDOWS_SETUP.md`. Run the publisher in ONE place at a time
 (duplicate MQTT client IDs evict each other).
 
-**API endpoints** (no authentication at all today — sandbox only;
-`API_SECURITY_SPEC.md` is the approved-pending design for locking this down):
-- `GET /packs` → `{packs:[{pack_id, online, last_seen},...]}` (packs seen in
-  last 7d; becomes the entitlement-filtered list in spec phase S2)
+**API endpoints** (S1+S2 of `API_SECURITY_SPEC.md` are LIVE since 2026-07-31:
+every route requires `Authorization: Bearer <Cognito access token>` and every
+response is entitlement-filtered per user — see §7 and `API_ACCESS.md`):
+- `GET /packs` → `{packs:[{pack_id, online, last_seen},...]}` (only packs the
+  caller is entitled to)
 - `GET /packs/{pack_id}/latest` → `{pack_id, updated_ts, telemetry:{...}, status:{...}}`
   (`status` is `{}` unless `?status=1` — costs a second InfluxDB query and
   liveness derives from telemetry freshness now)
@@ -211,6 +212,8 @@ old per-field endpoints so Pages deploys never race Lambda deploys.
 
 **To run it:** `source aws/config.env`, start the publisher with the four cert
 flags (see README §2), then `cd dashboard && python3 -m http.server 8000`.
+The dashboard now opens with a sign-in gate — use `helt-ops@example.com`
+(password in git-ignored `aws/config.env`, `COGNITO_OPS_PASSWORD`).
 
 ---
 
@@ -288,11 +291,12 @@ pack_ids → allowed fields; two credential types (short-lived JWTs from a login
 end users in a browser, API keys for business backends) both converging on one
 authorization check; rate limits / usage plans.
 
-**Designed (2026-07-24, awaiting approval):** `API_SECURITY_SPEC.md` — Cognito
-User Pool + Hosted UI, API Gateway JWT authorizer, DynamoDB `helt_entitlements`
-(user → pack → field groups `core/health/location/ops`), enforcement + audit in
-the query Lambda, stage throttling, CORS lockdown. Rollout phases S1–S3. Five
-open questions at the end need answers before S1 code starts.
+**Implemented (2026-07-31, phases S1+S2):** `API_SECURITY_SPEC.md` v0.2 —
+Cognito User Pool (headless users; Hosted UI deliberately deferred, spec §10),
+API Gateway JWT authorizer on every route, DynamoDB `helt_entitlements`
+(user → pack → field groups `core/health/location/ops`, managed by
+`aws/grant.py`), enforcement + audit in the query Lambda, CORS lockdown.
+Phase S3 (throttles, SSM, concurrency increase) remains. See §7.
 
 ---
 
@@ -304,12 +308,41 @@ realistic multi-pack simulation, dashboard rebuilt on the official brand with
 charts/map/pack-picker (live on GitHub Pages), query-cost fixes (30 s cache,
 bundled `/histories`, 30 s polling), freshness-based liveness.
 
-**Next: implement API security per `API_SECURITY_SPEC.md`** (Cognito + JWT
-authorizer + entitlements + CORS lockdown + throttling, phases S1–S3). The
-spec's §10 open questions need the user's answers before S1 code starts.
-Data flow stays pull-only for now — push delivery, a cursor/mirroring
-endpoint, and a DynamoDB latest-state table were analysed (see chat history
-2026-07-27ff) and deliberately deferred.
+**Done (2026-07-31): API security phases S1+S2, live and verified.** The
+spec's §10 questions are answered in the spec (headline: Hosted UI login
+DEFERRED — the single customer gets email+password in a document,
+`API_ACCESS.md`, and fetches 1 h tokens by script; same accounts later log
+into a real login page with zero migration). What exists now:
+
+- Cognito pool `helt-users` + public app client (`USER_PASSWORD_AUTH`);
+  pool/client ids and the three demo users' generated passwords live in
+  git-ignored `aws/config.env` (`COGNITO_*`). Admin-create only.
+- JWT authorizer on all five explicit routes; CORS locked to the github.io
+  + localhost:8000 origins. **Two live findings, baked into setup.sh
+  step8:** quick-create's `$default` route is ApiGatewayManaged and
+  UNDELETABLE → it is JWT-locked instead (anon unknown path = 401); and
+  CORS preflights need an explicit unauthenticated `OPTIONS /{proxy+}`
+  route because `$default` matching everything disables the gateway's
+  auto-preflight answers.
+- DynamoDB `helt_entitlements` + `aws/grant.py` (grant/revoke/list; shells
+  out to the aws CLI so it shares your `aws login` session — boto3 can't
+  read those creds). Demo grants: customer-a → 01-03 ALL; customer-b →
+  04-05 core,health,ops (no location); helt-ops → `*` ALL.
+- Query Lambda enforces per-pack + per-field-group access AFTER its 30 s
+  response cache (cache holds raw Influx reads keyed by pack/range — never
+  per user), 403s are existence-neutral, and every request emits a one-line
+  JSON audit record to CloudWatch.
+- Dashboard has a minimal sign-in gate (sessionStorage tokens, hourly
+  refresh, sign-out); the map hides for users without `location`.
+- `aws/acceptance.sh`: 20 live checks covering both spec demos (S1:
+  anon 401 → token → data; S2: A sees 01-03, B sees 04-05 without
+  location, B's `/track` 403s, B's map hides). All passing 2026-07-31.
+
+**Next: spec phase S3** — stage/route throttles, Influx tokens to SSM
+SecureString, Lambda concurrency-increase request. Then the InfluxDB
+retention policy (§7 below). Data flow stays pull-only — push delivery, a
+cursor/mirroring endpoint, and a DynamoDB latest-state table were analysed
+(see chat history 2026-07-27ff) and deliberately deferred.
 
 **Payload dependency chain (for any future field change):** the serializer in
 `main/cloud_sync.c` (or `fake_pack.py` in sandbox) → the ingest Lambda's three
