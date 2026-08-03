@@ -94,9 +94,9 @@ One item = "this user may see this pack, at this field granularity."
 not raw fields, so adding a telemetry field later doesn't require touching
 every entitlement row:
 
-| Group | Fields today (re-cut 2026-08-03: electrical internals + diagnostics moved to `ops`) |
+| Group | Fields today (re-cut 2026-08-03: electrical internals + diagnostics moved to `ops`; power ports renamed same day — see HANDOFF §4) |
 |---|---|
-| `core` | `soc_pct`, `power_w`, `inv_output_w`, `dc_input_w` |
+| `core` | `soc_pct`, `total_input_w`, `total_output_w`, `ac_output_w`, `dc_output_w`, `ac_input_w`, `solar_input_w` |
 | `health` | `soh_pct`, `cycle_count`, `enclosure_temp_c` (ambient), `enclosure_humidity_pct` |
 | `location` | `lat`, `lon` (gates `/track` entirely) |
 | `ops` | `si_state`, `bms_state`, `seq`, `ts_synced`, `pack_voltage_v`, `current_a`, `max_cell_temp_c`, `bms_protections`, status payload fields |

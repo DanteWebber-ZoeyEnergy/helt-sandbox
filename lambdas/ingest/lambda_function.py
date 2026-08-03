@@ -2,8 +2,11 @@
 sandbox-ingest -- production helt-iot-influx Lambda PLUS sandbox-ahead fields.
 
 DIVERGENCE NOTE: the sandbox schema runs ahead of firmware v1 -- this copy
-additionally parses soh_pct, cycle_count, lat, lon. Fold these into the
-production cloud/aws/lambda_function.py when the firmware serializer catches up.
+additionally parses soh_pct, cycle_count, lat, lon, and the power-port fields
+total_input_w / total_output_w / ac_output_w / dc_output_w / ac_input_w /
+solar_input_w (which replace power_w / inv_output_w / dc_input_w). Fold these
+into the production cloud/aws/lambda_function.py when the firmware serializer
+catches up.
 
 AWS IoT Rule -> InfluxDB Cloud. Receives MQTT messages via the IoT Rule SQL,
 transforms JSON to InfluxDB line protocol, POSTs to the v2 write API.
@@ -44,12 +47,12 @@ def lambda_handler(event, context):
         for s in event.get("samples", []):
             tags = f"pack_id={esc_tag(pack_id)},ts_synced={'true' if s.get('ts_synced') else 'false'}"
             fields = []
-            for f in ("seq", "si_state", "bms_state", "soc_pct", "inv_output_w", "dc_input_w", "bms_protections", "cycle_count"):
+            for f in ("seq", "si_state", "bms_state", "soc_pct", "total_input_w", "total_output_w",
+                      "ac_output_w", "dc_output_w", "ac_input_w", "solar_input_w",
+                      "bms_protections", "cycle_count"):
                 if f in s: fields.append(f"{f}={int(s[f])}u")
             for f in ("pack_voltage_v", "current_a", "max_cell_temp_c", "enclosure_temp_c", "enclosure_humidity_pct", "soh_pct", "lat", "lon"):
                 if f in s: fields.append(f"{f}={float(s[f])}")
-            for f in ("power_w",):
-                if f in s: fields.append(f"{f}={int(s[f])}i")
             if fields:
                 lines.append(f"telemetry,{tags} {','.join(fields)} {s.get('ts', 0)}")
 

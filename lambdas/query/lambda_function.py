@@ -71,7 +71,8 @@ FIELD_GROUPS = {
     # core = customer-facing performance; ops = internal electricals +
     # diagnostics (voltage/current/cell-temp/protections live there since
     # 2026-08-03); health = wear + ambient environment.
-    "core":     {"soc_pct", "power_w", "inv_output_w", "dc_input_w"},
+    "core":     {"soc_pct", "total_input_w", "total_output_w",
+                 "ac_output_w", "dc_output_w", "ac_input_w", "solar_input_w"},
     "health":   {"soh_pct", "cycle_count", "enclosure_temp_c",
                  "enclosure_humidity_pct"},
     "location": {"lat", "lon"},

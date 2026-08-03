@@ -8,8 +8,10 @@ so everything downstream (IoT Core -> Rule -> Lambda -> InfluxDB) is identical
 to production. No hardware required. Runs on macOS/Linux/Windows (Python 3.9+).
 
 SANDBOX SCHEMA NOTE: this publisher runs AHEAD of firmware schema v1 -- it adds
-soh_pct, cycle_count, lat, lon to each sample. The firmware serializer in
-main/cloud_sync.c does not emit these yet; the ingest Lambda accepts both.
+soh_pct, cycle_count, lat, lon to each sample, and models the power ports
+explicitly: ac_input_w / solar_input_w / ac_output_w / dc_output_w plus
+total_input_w / total_output_w (replacing power_w / inv_output_w / dc_input_w).
+The firmware serializer in main/cloud_sync.c does not emit these yet.
 
 SANDBOX AUTH NOTE: with --packs N all simulated packs share the one sandbox
 certificate. That works because the sandbox IoT policy is permissive; in
@@ -57,10 +59,13 @@ def make_client(pack_id):
 # Pack simulation
 #
 # Plausible-but-simple model: a 16S LFP pack cycling CHARGE / REST / DISCHARGE.
-# SoC integrates real power flow over the nominal capacity, voltage follows a
-# linearised OCV curve with IR sag, thermals lag |power|, and cycle count is
-# equivalent-full-cycle (accumulated discharge energy / capacity).
-# Sign convention matches the firmware: positive W / A = charging.
+# Power flows through four ports: AC input (grid charger, ~constant while
+# charging), SOLAR input (MPPT, wanders with cloud cover), AC output (inverter)
+# and DC output (12V/USB rail). Battery power = inputs - outputs (with charger/
+# inverter efficiency); SoC integrates that over the nominal capacity, voltage
+# follows a linearised OCV curve with IR sag, thermals lag |power|, and cycle
+# count is equivalent-full-cycle (accumulated discharge energy / capacity).
+# Sign convention matches the firmware: positive internal W / A = charging.
 # ---------------------------------------------------------------------------
 
 PHASE_STATES = {              # phase -> (si_state, bms_state)
@@ -68,6 +73,12 @@ PHASE_STATES = {              # phase -> (si_state, bms_state)
     "DISCHARGE": (4, 3),      # BMS STATE_MACHINE_SPEC when the fw catches up
     "REST":      (5, 4),
 }
+
+# Port ratings (W)
+AC_OUT_MAX_W = 2000.0         # inverter continuous rating
+DC_OUT_MAX_W = 580.0          # DC / USB rail
+SOLAR_MAX_W  = 400.0          # MPPT input
+AC_IN_W      = 720.0          # grid charger, roughly constant while charging
 
 
 class PackSim:
@@ -82,11 +93,15 @@ class PackSim:
         self.home = (home_lat, home_lon)
         self.phase = "REST"
         self.phase_left = 5.0                   # start almost immediately
-        self.setpoint_w = 0.0
+        self.ac_in_w = 0.0                      # per-port setpoints (W)
+        self.solar_w = 0.0
+        self.ac_out_w = 0.0
+        self.dc_out_w = 0.0
 
     def _next_phase(self):
         if self.phase in ("CHARGE", "DISCHARGE"):
-            self.phase, self.setpoint_w = "REST", 0.0
+            self.phase = "REST"
+            self.ac_in_w = self.solar_w = self.ac_out_w = self.dc_out_w = 0.0
             self.phase_left = random.uniform(60, 300)
             return
         # leaving REST: bias direction by SoC so we don't slam the limits
@@ -97,9 +112,15 @@ class PackSim:
         else:
             go_charge = random.random() < 0.5
         if go_charge:
-            self.phase, self.setpoint_w = "CHARGE", random.uniform(600, 1800)
+            self.phase = "CHARGE"
+            self.ac_in_w = AC_IN_W
+            self.solar_w = random.uniform(0.3, 1.0) * SOLAR_MAX_W
+            self.ac_out_w = self.dc_out_w = 0.0
         else:
-            self.phase, self.setpoint_w = "DISCHARGE", -random.uniform(200, 1500)
+            self.phase = "DISCHARGE"
+            self.ac_in_w = self.solar_w = 0.0
+            self.ac_out_w = random.uniform(0.1, 1.0) * AC_OUT_MAX_W
+            self.dc_out_w = random.uniform(0.0, 1.0) * DC_OUT_MAX_W
         self.phase_left = random.uniform(180, 900)
 
     def sample(self, seq, ts, dt):
@@ -110,10 +131,21 @@ class PackSim:
                 or (self.phase == "DISCHARGE" and self.soc <= 15.0)):
             self._next_phase()
 
-        if self.phase == "REST":
-            power = -15.0 + random.uniform(-8.0, 8.0)   # standby drain
-        else:
-            power = self.setpoint_w * random.uniform(0.97, 1.03)
+        if self.phase == "CHARGE":
+            ac_in = self.ac_in_w * random.uniform(0.98, 1.02)   # ~constant grid draw
+            self.solar_w = min(SOLAR_MAX_W, max(0.0,            # cloud-cover wander
+                self.solar_w + random.uniform(-15.0, 15.0)))
+            solar_in = self.solar_w
+            ac_out = dc_out = 0.0
+            power = (ac_in + solar_in) * 0.95                   # charger efficiency
+        elif self.phase == "DISCHARGE":
+            ac_in = solar_in = 0.0
+            ac_out = min(AC_OUT_MAX_W, self.ac_out_w * random.uniform(0.97, 1.03))
+            dc_out = min(DC_OUT_MAX_W, self.dc_out_w * random.uniform(0.97, 1.03))
+            power = -(ac_out + dc_out) / 0.94                   # inverter losses
+        else:  # REST
+            ac_in = solar_in = ac_out = dc_out = 0.0
+            power = -15.0 + random.uniform(-8.0, 8.0)           # standby drain
 
         self.soc += power * dt / 3600.0 / self.capacity_wh * 100.0
         self.soc = min(100.0, max(0.0, self.soc))
@@ -145,10 +177,13 @@ class PackSim:
             "soc_pct": int(round(self.soc)),
             "pack_voltage_v": round(v, 2),
             "current_a": round(current, 2),
-            "power_w": int(power),
+            "total_input_w": int(ac_in + solar_in),
+            "total_output_w": int(ac_out + dc_out),
             "max_cell_temp_c": round(self.cell_temp, 1),
-            "inv_output_w": int(-power * 0.94) if power < 0 else 0,
-            "dc_input_w": int(power / 0.95) if power > 0 else 0,
+            "ac_output_w": int(ac_out),
+            "dc_output_w": int(dc_out),
+            "ac_input_w": int(ac_in),
+            "solar_input_w": int(solar_in),
             "bms_protections": 0,
             "enclosure_temp_c": round(self.encl_temp, 1),
             "enclosure_humidity_pct": round(self.humidity, 1),
@@ -223,7 +258,8 @@ class Pack:
         note = "sent" if ok else \
                f"NOT DELIVERED (rc={info.rc}, connected={self.connected})"
         print(f"[pub] {self.pack_id}  seq<={self.seq}  {self.sim.phase:<9} "
-              f"soc={last['soc_pct']}%  p={last['power_w']}W  -> {note}")
+              f"soc={last['soc_pct']}%  in={last['total_input_w']}W  "
+              f"out={last['total_output_w']}W  -> {note}")
 
     def stop(self, uptime):
         self.client.publish(f"{self.base}/status", json.dumps(

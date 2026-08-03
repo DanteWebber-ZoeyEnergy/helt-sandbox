@@ -86,6 +86,9 @@ Command ACKs are echoed onto `status` (non-retained). No separate ack topic.
     "enclosure_humidity_pct":47.3 } ] }
 ```
 
+(This is what the *firmware* emits today. The sandbox payload has diverged —
+extra fields AND renamed power fields — see the schema-ahead note in §4.)
+
 Other payloads: `v1.cells` (per-cell mV, off by default), status on connect
 (`online, pack_id, fw_version, uptime_s, si_state, ip`), command ACK
 (`{"ack":{"request_id","status","result"}}`), inbound command
@@ -135,16 +138,26 @@ the real pipeline.
 
 **Sandbox schema runs ahead of firmware v1** (since 2026-07-24): every sample
 additionally carries `soh_pct` (float 1dp), `cycle_count` (uint), `lat`/`lon`
-(float 6dp, WGS84). The sandbox ingest Lambda parses these; the production
-`cloud/aws/lambda_function.py` in the firmware repo does **not** yet — so the
-two copies deliberately diverge until the firmware serializer catches up.
-Firmware prerequisites for catch-up: BMS must expose SoH + cycle count over CAN
-(check `CAN_COMM.md`), and GPS needs a source decision — the SI board has **no
-GNSS hardware** (options: GNSS module in a hardware rev, WiFi geolocation, or a
-provisioned static install location).
+(float 6dp, WGS84). **Power-port re-cut (2026-08-03):** the sandbox REPLACES
+the firmware's `power_w` / `inv_output_w` / `dc_input_w` with six port fields
+(all uint W): `ac_input_w` (grid charger, ~720 W while charging),
+`solar_input_w` (MPPT, ≤400 W), `ac_output_w` (inverter, ≤2000 W),
+`dc_output_w` (12V/USB rail, ≤580 W), plus `total_input_w` / `total_output_w`
+(the port sums). The deployed sandbox ingest parses the new names and has
+DROPPED the old three — real firmware pointed at the sandbox would lose its
+power fields. The production `cloud/aws/lambda_function.py` in the firmware
+repo has **none** of this — the two copies deliberately diverge until the
+firmware serializer catches up. Firmware prerequisites for catch-up: BMS must
+expose SoH + cycle count over CAN (check `CAN_COMM.md`); GPS needs a source
+decision — the SI board has **no GNSS hardware** (options: GNSS module in a
+hardware rev, WiFi geolocation, or a provisioned static install location);
+and the SI must meter the four power ports individually to emit the port
+fields.
 
 `fake_pack.py` also simulates realistic behaviour instead of random values: a
-CHARGE/REST/DISCHARGE phase machine, SoC integrated from power over a nominal
+CHARGE/REST/DISCHARGE phase machine driving the four power ports (AC in +
+solar while charging, AC + DC loads while discharging), SoC integrated from
+net port power (with charger/inverter efficiency) over a nominal
 capacity (`--capacity-wh`, default 2560), linearised OCV + IR sag for voltage,
 thermal lag, equivalent-full-cycle counting (`--cycles` seed), and GPS jitter
 around `--home-lat/--home-lon` (default Cape Town). Batch timestamps are spread
@@ -338,6 +351,15 @@ into a real login page with zero migration). What exists now:
   anon 401 → token → data; S2: A sees 01-03, B sees 04-05 without
   location, B's `/track` 403s, B's map hides). All passing 2026-07-31.
 
+**Done (2026-08-03): power-port schema re-cut, deployed end-to-end.**
+`power_w` / `inv_output_w` / `dc_input_w` replaced by the six port fields
+(see §4). `fake_pack.py` models the ports; both Lambdas updated and
+redeployed (`update-function-code`, verified `Successful`); the query
+Lambda's `core` group now grants the six new fields; the dashboard's
+`FIELDS` roster shows 12 charts and the KPI tile is "Net power"
+(`total_input_w − total_output_w`, same ±30 W charging/discharging
+thresholds). Old-name data stays in InfluxDB but stops accruing.
+
 **Next: spec phase S3** — stage/route throttles, Influx tokens to SSM
 SecureString, Lambda concurrency-increase request. Then the InfluxDB
 retention policy (§7 below). Data flow stays pull-only — push delivery, a
@@ -345,10 +367,11 @@ cursor/mirroring endpoint, and a DynamoDB latest-state table were analysed
 (see chat history 2026-07-27ff) and deliberately deferred.
 
 **Payload dependency chain (for any future field change):** the serializer in
-`main/cloud_sync.c` (or `fake_pack.py` in sandbox) → the ingest Lambda's three
-type-bucket loops (`u` / float / `i`) → `cloud/influxdb_schema.md` → the
-dashboard's `FIELDS` array → possibly the query Lambda. **And** any new or
-retyped field collides with the IOx locked schema in whichever bucket it lands.
+`main/cloud_sync.c` (or `fake_pack.py` in sandbox) → the ingest Lambda's two
+type-bucket loops (`u` / float; the signed-`i` bucket died with `power_w`,
+2026-08-03) → `cloud/influxdb_schema.md` → the dashboard's `FIELDS` array →
+possibly the query Lambda. **And** any new or retyped field collides with the
+IOx locked schema in whichever bucket it lands.
 
 **Also outstanding:** InfluxDB retention policy on `helt_sandbox` (storage
 grows ~0.35 GB/mo); firmware catch-up prerequisites in §4; the two firmware-repo
