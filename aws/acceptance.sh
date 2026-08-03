@@ -15,19 +15,19 @@ bad()  { FAIL=$((FAIL+1)); echo "  FAIL  $1  -> $2"; }
 check(){ [ "$2" = "$3" ] && ok "$1" || bad "$1" "got: $2  want: $3"; }
 
 tok() {  # $1 email  $2 password -> access token on stdout
-  curl -s "$IDP" -H 'Content-Type: application/x-amz-json-1.1' \
+  curl -sS -m 45 "$IDP" -H 'Content-Type: application/x-amz-json-1.1' \
     -H 'X-Amz-Target: AWSCognitoIdentityProviderService.InitiateAuth' \
     -d "{\"AuthFlow\":\"USER_PASSWORD_AUTH\",\"ClientId\":\"$COGNITO_CLIENT_ID\",\"AuthParameters\":{\"USERNAME\":\"$1\",\"PASSWORD\":\"$2\"}}" \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["AuthenticationResult"]["AccessToken"])'
 }
-code() { curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $1" "$API$2"; }
-body() { curl -s -H "Authorization: Bearer $1" "$API$2"; }
+code() { curl -sS -m 45 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $1" "$API$2"; }
+body() { curl -sS -m 45 -H "Authorization: Bearer $1" "$API$2"; }
 
 echo "== S1: authentication =="
-check "anonymous /packs -> 401" "$(curl -s -o /dev/null -w '%{http_code}' "$API/packs")" 401
+check "anonymous /packs -> 401" "$(curl -sS -m 45 -o /dev/null -w '%{http_code}' "$API/packs")" 401
 check "garbage token -> 401" "$(code notatoken /packs)" 401
 check "anon unknown route -> 401 (no route enum)" \
-  "$(curl -s -o /dev/null -w '%{http_code}' "$API/nope")" 401
+  "$(curl -sS -m 45 -o /dev/null -w '%{http_code}' "$API/nope")" 401
 
 TA=$(tok "$COGNITO_CUSTA_EMAIL" "$COGNITO_CUSTA_PASSWORD") || exit 1
 TB=$(tok "$COGNITO_CUSTB_EMAIL" "$COGNITO_CUSTB_PASSWORD") || exit 1
@@ -37,12 +37,12 @@ TO=$(tok "$COGNITO_OPS_EMAIL"   "$COGNITO_OPS_PASSWORD")   || exit 1
 check "customer-a /packs -> 200" "$(code "$TA" /packs)" 200
 
 echo "== S1: CORS =="
-ALLOWED=$(curl -s -o /dev/null -w '%{header_json}' -X OPTIONS "$API/packs" \
+ALLOWED=$(curl -sS -m 45 -o /dev/null -w '%{header_json}' -X OPTIONS "$API/packs" \
   -H "Origin: https://dantewebber-zoeyenergy.github.io" \
   -H "Access-Control-Request-Method: GET" -H "Access-Control-Request-Headers: authorization" \
   | python3 -c 'import json,sys; h=json.load(sys.stdin); print(h.get("access-control-allow-origin",["-"])[0])')
 check "preflight allows github.io origin" "$ALLOWED" "https://dantewebber-zoeyenergy.github.io"
-DENIED=$(curl -s -o /dev/null -w '%{header_json}' -X OPTIONS "$API/packs" \
+DENIED=$(curl -sS -m 45 -o /dev/null -w '%{header_json}' -X OPTIONS "$API/packs" \
   -H "Origin: https://evil.example" \
   -H "Access-Control-Request-Method: GET" -H "Access-Control-Request-Headers: authorization" \
   | python3 -c 'import json,sys; h=json.load(sys.stdin); print(h.get("access-control-allow-origin",["-"])[0])')
@@ -64,13 +64,13 @@ check "403 body is existence-neutral" \
 
 echo "== S2: per-field entitlement (B has no location) =="
 check "B /histories has no lat/lon" \
-  "$(body "$TB" '/packs/SANDBOX-04/histories?range=7d' | python3 -c 'import json,sys; s=json.load(sys.stdin)["series"]; print(sorted(set(s)&{"lat","lon"}))')" \
+  "$(body "$TB" '/packs/SANDBOX-04/histories?range=1h' | python3 -c 'import json,sys; s=json.load(sys.stdin)["series"]; print(sorted(set(s)&{"lat","lon"}))')" \
   "[]"
 check "A /histories HAS lat/lon" \
-  "$(body "$TA" '/packs/SANDBOX-01/histories?range=7d' | python3 -c 'import json,sys; s=json.load(sys.stdin)["series"]; print(sorted(set(s)&{"lat","lon"}))')" \
+  "$(body "$TA" '/packs/SANDBOX-01/histories?range=1h' | python3 -c 'import json,sys; s=json.load(sys.stdin)["series"]; print(sorted(set(s)&{"lat","lon"}))')" \
   "['lat', 'lon']"
-check "B /track -> 403" "$(code "$TB" '/packs/SANDBOX-04/track?range=7d')" 403
-check "A /track -> 200" "$(code "$TA" '/packs/SANDBOX-01/track?range=7d')" 200
+check "B /track -> 403" "$(code "$TB" '/packs/SANDBOX-04/track?range=1h')" 403
+check "A /track -> 200" "$(code "$TA" '/packs/SANDBOX-01/track?range=1h')" 200
 check "B /history field=lat -> 403" "$(code "$TB" '/packs/SANDBOX-04/history?field=lat')" 403
 check "B /history field=soc_pct -> 200" "$(code "$TB" '/packs/SANDBOX-04/history?field=soc_pct')" 200
 check "unknown field -> 400" "$(code "$TB" '/packs/SANDBOX-04/history?field=sneaky')" 400
