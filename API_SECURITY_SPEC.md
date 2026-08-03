@@ -94,12 +94,12 @@ One item = "this user may see this pack, at this field granularity."
 not raw fields, so adding a telemetry field later doesn't require touching
 every entitlement row:
 
-| Group | Fields today |
+| Group | Fields today (re-cut 2026-08-03: electrical internals + diagnostics moved to `ops`) |
 |---|---|
-| `core` | `soc_pct`, `power_w`, `pack_voltage_v`, `current_a`, `inv_output_w`, `dc_input_w` |
-| `health` | `soh_pct`, `cycle_count`, `max_cell_temp_c`, `enclosure_temp_c`, `enclosure_humidity_pct`, `bms_protections` |
+| `core` | `soc_pct`, `power_w`, `inv_output_w`, `dc_input_w` |
+| `health` | `soh_pct`, `cycle_count`, `enclosure_temp_c` (ambient), `enclosure_humidity_pct` |
 | `location` | `lat`, `lon` (gates `/track` entirely) |
-| `ops` | `si_state`, `bms_state`, `seq`, `ts_synced`, status payload fields |
+| `ops` | `si_state`, `bms_state`, `seq`, `ts_synced`, `pack_voltage_v`, `current_a`, `max_cell_temp_c`, `bms_protections`, status payload fields |
 
 The group→field mapping is a constant in the query Lambda (versioned with the
 code, same place the dependency chain already lives).

@@ -110,10 +110,10 @@ Access is per-pack and per-field-group. Groups:
 
 | Group | Fields |
 |---|---|
-| `core` | soc_pct, power_w, pack_voltage_v, current_a, inv_output_w, dc_input_w |
-| `health` | soh_pct, cycle_count, max_cell_temp_c, enclosure_temp_c, enclosure_humidity_pct, bms_protections |
+| `core` | soc_pct, power_w, inv_output_w, dc_input_w |
+| `health` | soh_pct, cycle_count, enclosure_temp_c, enclosure_humidity_pct |
 | `location` | lat, lon (and the `/track` endpoint) |
-| `ops` | si_state, bms_state, seq, ts_synced |
+| `ops` | si_state, bms_state, seq, ts_synced, pack_voltage_v, current_a, max_cell_temp_c, bms_protections |
 
 Your grant: `<GROUPS PER PACK>`. Fields outside your grant are simply absent
 from responses; endpoints outside it return `403 {"error":"forbidden"}`.

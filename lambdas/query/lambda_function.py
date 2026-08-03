@@ -68,13 +68,16 @@ RANGES = {
 # later means touching this map only, never the DynamoDB rows. This map is
 # part of the payload dependency chain (HANDOFF.md §7).
 FIELD_GROUPS = {
-    "core":     {"soc_pct", "power_w", "pack_voltage_v", "current_a",
-                 "inv_output_w", "dc_input_w"},
-    "health":   {"soh_pct", "cycle_count", "max_cell_temp_c",
-                 "enclosure_temp_c", "enclosure_humidity_pct",
-                 "bms_protections"},
+    # core = customer-facing performance; ops = internal electricals +
+    # diagnostics (voltage/current/cell-temp/protections live there since
+    # 2026-08-03); health = wear + ambient environment.
+    "core":     {"soc_pct", "power_w", "inv_output_w", "dc_input_w"},
+    "health":   {"soh_pct", "cycle_count", "enclosure_temp_c",
+                 "enclosure_humidity_pct"},
     "location": {"lat", "lon"},
-    "ops":      {"si_state", "bms_state", "seq", "ts_synced"},
+    "ops":      {"si_state", "bms_state", "seq", "ts_synced",
+                 "pack_voltage_v", "current_a", "max_cell_temp_c",
+                 "bms_protections"},
 }
 ALL_FIELDS = set().union(*FIELD_GROUPS.values())
 
