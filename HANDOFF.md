@@ -45,9 +45,14 @@ Everything from the pack to InfluxDB is **push**. From InfluxDB to a viewer it i
    ring buffer, batches, and publishes every 30 s (`CONFIG_CLOUD_BATCH_PERIOD_S`)
    or at 4096 bytes, whichever first.
 2. **AWS IoT Core** authenticates the pack by X.509 client cert (CN = `pack_id`).
-3. **IoT Rule** — standing SQL `SELECT *, topic() AS mqtt_topic FROM 'helt/pack/+/+'`.
-   `topic()` is load-bearing: it's how the Lambda gets `pack_id` without trusting
-   the JSON body.
+3. **IoT Rule** — standing SQL `SELECT *, topic() AS mqtt_topic FROM 'helt/pack/+/+'`
+   **plus a `WHERE` on the pack_id segment (since 2026-09-21):** the production
+   rule `helt_to_influx` takes `NOT startswith(topic(3), 'SANDBOX-')`, the
+   sandbox rule `sandbox_to_influx` takes `startswith(topic(3), 'SANDBOX-')`.
+   Rules are account-wide and every matching rule fires, so without the split a
+   real pack would be double-ingested into both buckets. Never give a real pack
+   a `SANDBOX-` id. `topic()` is load-bearing: it's how the Lambda gets
+   `pack_id` without trusting the JSON body.
 4. **Ingest Lambda** transforms JSON → InfluxDB line protocol, POSTs to the v2
    write API. Stdlib only, Python 3.12, arm64, 128 MB.
 5. **InfluxDB Cloud Serverless** is the store of record.
@@ -181,13 +186,38 @@ helt-sandbox/
 are in `aws/config.env`, which is git-ignored):
 
 - IoT Thing `SANDBOX-01` + an active cert with `sandbox-pack-policy` attached
-- IoT Rule `sandbox_to_influx`
+- IoT Rule `sandbox_to_influx` (scoped to `SANDBOX-*` pack_ids)
 - Lambdas `sandbox-ingest`, `sandbox-query`, role `sandbox-lambda-role`
 - API Gateway HTTP API (quick-create, `$default` catch-all route, CORS `*`)
 
-**InfluxDB:** org `Helt`. Two buckets —
-- `helt_telemetry` — **production**, contains the Telegraf-era schema. Do not write sandbox data here.
-- `helt_sandbox` — what the sandbox writes to now.
+**Production resources (stood up 2026-09-21, firmware repo
+`cloud/aws/RUNBOOK.md` is their runbook; same account/region):**
+- IoT Policy `helt-pack-policy` v1 (CN-scoped; `iot:RetainPublish` on `status`)
+- IoT Rule `helt_to_influx` (every pack_id NOT prefixed `SANDBOX-`) →
+  Lambda `helt-iot-influx` (role `helt-lambda-role`, log group at 7-day
+  retention) → bucket `helt_prod`. The Lambda is the firmware repo's
+  `cloud/aws/lambda_function.py` unchanged (schema v1 fields).
+- No Thing/cert yet — minted per pack at provisioning time (RUNBOOK §4).
+
+**InfluxDB:** org `Helt`. Three buckets —
+- `helt_prod` — **production**, real packs, 30-day retention, schema v1 as the
+  firmware emits it today. Written only by `helt-iot-influx`.
+- `helt_sandbox` — the sandbox's bucket, 7-day retention, `SANDBOX-*` fakes
+  only, schema-ahead (§4 above).
+- `helt_telemetry` — **retired.** Telegraf-era IOx schema with every `uint`
+  field locked as int64; nothing writes here any more. Delete when convenient.
+
+**The query Lambda reads both live buckets.** `sandbox-query` takes an
+optional `INFLUXDB_PROD_BUCKET`; when set, any pack_id not prefixed `SANDBOX-`
+is read from that bucket (`bucket_for()` in `lambdas/query/lambda_function.py`),
+`/packs` unions both, and the read token must cover both buckets. Unset =
+single-bucket mode, byte-identical to the old behaviour. Access is unchanged:
+the DynamoDB entitlements decide who sees which pack regardless of bucket, so
+a real pack is visible to `helt-ops` (`*`) and to whoever is explicitly
+granted it, never to the sandbox demo customers. Caveat until the firmware
+payload catches up (§7): the v1 power fields (`power_w` / `inv_output_w` /
+`dc_input_w`) are not in any `FIELD_GROUPS` entry, so the API drops them and
+the dashboard's power charts + Net-power tile stay empty for real packs.
 
 **Multi-pack fleet simulation** (since 2026-07-24): `fake_pack.py --packs N`
 (N ≤ 5) simulates a fleet from built-in per-pack profiles — distinct Western
@@ -259,17 +289,24 @@ Fixed **in the sandbox**:
    API design: request a limit increase before any real fleet, and rate-limit at
    the gateway so one client can't starve the pool.
 
-**Still outstanding in the FIRMWARE repo** (tracked as a spawned task):
+**Resolved in the FIRMWARE repo / production stack (2026-09-21, firmware
+Phase 7A):**
 
-- `cloud/aws/iot_policy.json` still lacks `iot:RetainPublish` on the `status`
-  topic → **real packs will not be able to connect**. The status topic needs
-  `["iot:Publish","iot:RetainPublish"]`; telemetry needs only `iot:Publish`.
-- The schema conflict (#2) will hit the production cutover the moment real packs
-  write to `helt_telemetry`. Options: match Telegraf's exact types in the Lambda,
-  drop the measurement (destructive — needs explicit approval), or use a new
-  bucket. Compare the Lambda's three type-bucket loops against the old
-  `cloud/telegraf.conf` (recoverable from git history ≤ `861607f`) and
-  `cloud/influxdb_schema.md`.
+- `cloud/aws/iot_policy.json` now grants `["iot:Publish","iot:RetainPublish"]`
+  on the `status` topic (telemetry stays `iot:Publish`); deployed as
+  `helt-pack-policy` v1.
+- The schema conflict (#2) is sidestepped by writing production to a **new
+  bucket `helt_prod`** with the Lambda unchanged. Investigation note for the
+  record: the clash was never just `bms_protections`. The old `telegraf.conf`
+  declared nine fields `uint`, but Telegraf's `influxdb_v2` output downcasts
+  uint to int64 unless `influx_uint_support` is on, so **every** `u`-suffixed
+  field the Lambda writes (`seq`, `si_state`, `bms_state`, `soc_pct`,
+  `inv_output_w`, `dc_input_w`, `bms_protections`, `uptime_s`, `request_id`)
+  collided with `helt_telemetry`. "Match Telegraf's types" would have meant
+  retyping all of them to `i`, diverging from the sandbox ingest's `u` typing
+  that the payload catch-up (§7) later has to merge. `helt_telemetry` is
+  retired; the tokens in `config.env` cannot see it (they are bucket-scoped),
+  so confirm its retention/deletion from the InfluxDB UI.
 
 **Also outstanding (documented, deliberately deferred):** there is no
 `cloud_sync_deinit()`. esp-mqtt stores only the *pointer* to the cert/key PEM
@@ -359,6 +396,29 @@ Lambda's `core` group now grants the six new fields; the dashboard's
 `FIELDS` roster shows 12 charts and the KPI tile is "Net power"
 (`total_input_w − total_output_w`, same ±30 W charging/discharging
 thresholds). Old-name data stays in InfluxDB but stops accruing.
+
+**Done (2026-09-21): first-real-pack groundwork, AWS side (firmware Phase
+7A).** Production IoT policy / role / Lambda / rule / log group created from
+the firmware repo's RUNBOOK via CLI (nothing had been executed before — the
+account held only sandbox resources); `helt_prod` bucket; both IoT rules
+scoped on the `SANDBOX-` prefix; `sandbox-query` grew `INFLUXDB_PROD_BUCKET`
+routing (`setup.sh` step4/5 and `config.env.example` updated to match).
+Verified end-to-end without hardware: `aws iot-data publish` of a v1 sample
+for `TEST-0001` (ts = now − 29 d so it ages out of `helt_prod` within a day)
+invoked `helt-iot-influx` once (654 ms, no error) and landed all 13 fields in
+`helt_prod` at the SI timestamp with the locked IOx types exactly as
+`cloud/influxdb_schema.md` specifies (`unsignedLong` uints, `long` `power_w`,
+`double` floats); a `SANDBOX-01` control publish invoked only `sandbox-ingest`;
+`helt_sandbox` holds no `TEST-0001` rows; a direct invoke of `sandbox-query`
+`/packs` lists `TEST-0001` for `helt-ops` and nothing for `customer-a`.
+
+**Next for the real pack (own chats, firmware `CLOUD_SYNC_DESIGN.md` phases
+7B/7C):** 7B = Mac client (`SI-Mac-Client`) gains `PROV_CHUNK_WRITE`/`_ABORT`
+(0x45/0x46) + keys 10/11 and drops the HiveMQ-era `mqttUser`/`mqttPass`
+(key 3 becomes the AWS endpoint) — until then no client can push the
+cert/key. 7C = mint Thing + CSR cert for the chosen id (RUNBOOK §4; the id
+is fixed at cert issuance because CN = pack_id), provision live over BLE,
+bench run, and log what breaks in §5.
 
 **Next: spec phase S3** — stage/route throttles, Influx tokens to SSM
 SecureString, Lambda concurrency-increase request. Then the InfluxDB

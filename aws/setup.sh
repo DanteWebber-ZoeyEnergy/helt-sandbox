@@ -81,7 +81,7 @@ EOF
 
   ( cd ../lambdas/query && zip -j -q /tmp/query.zip lambda_function.py )
   cat > /tmp/query-env.json <<EOF
-{"Variables":{"INFLUXDB_URL":"$INFLUXDB_URL","INFLUXDB_READ_TOKEN":"$INFLUXDB_READ_TOKEN","INFLUXDB_BUCKET":"$INFLUXDB_BUCKET","INFLUXDB_ORG":"$INFLUXDB_ORG"}}
+{"Variables":{"INFLUXDB_URL":"$INFLUXDB_URL","INFLUXDB_READ_TOKEN":"$INFLUXDB_READ_TOKEN","INFLUXDB_BUCKET":"$INFLUXDB_BUCKET","INFLUXDB_PROD_BUCKET":"${INFLUXDB_PROD_BUCKET:-}","INFLUXDB_ORG":"$INFLUXDB_ORG"}}
 EOF
   aws lambda create-function --function-name "$QUERY_FN" \
     --runtime python3.12 --architecture arm64 \
@@ -92,9 +92,12 @@ EOF
 }
 
 step5() {  # IoT Rule -> ingest Lambda, and permission for IoT to invoke it
+  # Scoped to SANDBOX-* pack_ids only: real packs are routed by the PRODUCTION
+  # rule helt_to_influx (firmware repo cloud/aws/RUNBOOK.md §6) into helt_prod.
+  # The two rules are mutually exclusive on the topic's pack_id segment.
   banner "STEP 5  IoT Rule"
   cat > /tmp/rule.json <<EOF
-{"sql":"SELECT *, topic() AS mqtt_topic FROM 'helt/pack/+/+'","awsIotSqlVersion":"2016-03-23","ruleDisabled":false,"actions":[{"lambda":{"functionArn":"arn:aws:lambda:${REGION}:${ACCOUNT}:function:${INGEST_FN}"}}]}
+{"sql":"SELECT *, topic() AS mqtt_topic FROM 'helt/pack/+/+' WHERE startswith(topic(3), 'SANDBOX-')","awsIotSqlVersion":"2016-03-23","ruleDisabled":false,"actions":[{"lambda":{"functionArn":"arn:aws:lambda:${REGION}:${ACCOUNT}:function:${INGEST_FN}"}}]}
 EOF
   aws iot create-topic-rule --rule-name "$IOT_RULE" \
     --topic-rule-payload file:///tmp/rule.json --region "$REGION" \

@@ -35,6 +35,12 @@ this Lambda no longer emits CORS headers.
 
 Environment variables:
     INFLUXDB_URL / INFLUXDB_READ_TOKEN / INFLUXDB_BUCKET / INFLUXDB_ORG
+    INFLUXDB_PROD_BUCKET -- optional. When set, real packs (any pack_id NOT
+                            prefixed SANDBOX-) are read from this bucket and
+                            INFLUXDB_BUCKET holds only the SANDBOX-* fakes --
+                            the same split the two IoT rules make on the write
+                            side (helt_to_influx / sandbox_to_influx). The read
+                            token must cover both buckets. Unset = single bucket.
     ENTITLEMENTS_TABLE  -- DynamoDB table (default helt_entitlements)
 
 Stdlib only, except boto3 (bundled in the Lambda runtime) for DynamoDB.
@@ -47,6 +53,8 @@ URL    = os.environ["INFLUXDB_URL"]
 TOKEN  = os.environ["INFLUXDB_READ_TOKEN"]
 BUCKET = os.environ["INFLUXDB_BUCKET"]
 ORG    = os.environ["INFLUXDB_ORG"]
+PROD_BUCKET    = os.environ.get("INFLUXDB_PROD_BUCKET", "")
+SANDBOX_PREFIX = "SANDBOX-"
 DDB_TABLE = os.environ.get("ENTITLEMENTS_TABLE", "helt_entitlements")
 
 _ddb = boto3.client("dynamodb")
@@ -142,6 +150,22 @@ def fields_for(groups):
     return out
 
 
+def bucket_for(pack_id):
+    """Which bucket holds this pack. Real packs -> PROD_BUCKET, SANDBOX-* fakes
+    -> BUCKET; falls back to BUCKET for everything in single-bucket mode."""
+    if PROD_BUCKET and not pack_id.startswith(SANDBOX_PREFIX):
+        return PROD_BUCKET
+    return BUCKET
+
+
+def in_bucket(bucket, pack_id):
+    """True if pack_id BELONGS in bucket under the split above. /packs applies
+    this per bucket so a listed pack always resolves to the bucket its
+    /latest will read (a stray row written before the IoT rules were scoped
+    must not surface a pack whose data lives elsewhere)."""
+    return bucket_for(pack_id) == bucket
+
+
 def reply(code, body):
     return {"statusCode": code,
             "headers": {"Content-Type": "application/json"},
@@ -185,29 +209,32 @@ def all_packs():
     # promptly on a real drop, but fresh data is the honest "online" signal).
     # pack_id is a tag, so InfluxDB returns one table per pack; last() then
     # yields exactly one row per pack seen in the window.
-    flux = (
-        f'from(bucket:"{BUCKET}")'
-        f'|> range(start:-30d)'
-        f'|> filter(fn:(r)=> r._measurement=="telemetry" and r._field=="soc_pct")'
-        f'|> last()'
-        f'|> keep(columns:["pack_id","_time"])'
-    )
     now = time.time()
     packs = []
-    for r in influx_query(flux):
-        pid = r.get("pack_id")
-        if pid:
-            last_seen = _iso_to_epoch(r.get("_time", ""))
-            packs.append({"pack_id": pid,
-                          "online": (now - last_seen) < 90,   # 3x fw batch period
-                          "last_seen": last_seen})
+    buckets = [BUCKET] + ([PROD_BUCKET] if PROD_BUCKET else [])
+    for bucket in buckets:                      # one query per bucket, cached together
+        flux = (
+            f'from(bucket:"{bucket}")'
+            f'|> range(start:-30d)'
+            f'|> filter(fn:(r)=> r._measurement=="telemetry" and r._field=="soc_pct")'
+            f'|> last()'
+            f'|> keep(columns:["pack_id","_time"])'
+        )
+        for r in influx_query(flux):
+            pid = r.get("pack_id")
+            if pid and in_bucket(bucket, pid):
+                last_seen = _iso_to_epoch(r.get("_time", ""))
+                packs.append({"pack_id": pid,
+                              "online": (now - last_seen) < 90,   # 3x fw batch period
+                              "last_seen": last_seen})
     packs.sort(key=lambda p: p["pack_id"])
     return packs
 
 
 def latest_data(pack_id, include_status):
+    bucket = bucket_for(pack_id)
     flux = (
-        f'from(bucket:"{BUCKET}")'
+        f'from(bucket:"{bucket}")'
         f'|> range(start:-15m)'
         f'|> filter(fn:(r)=> r._measurement=="telemetry" and r.pack_id=="{pack_id}")'
         f'|> last()'
@@ -227,7 +254,7 @@ def latest_data(pack_id, include_status):
     status = {}
     if include_status:
         flux_status = (
-            f'from(bucket:"{BUCKET}")'
+            f'from(bucket:"{bucket}")'
             f'|> range(start:-30d)'
             f'|> filter(fn:(r)=> r._measurement=="pack_status" and r.pack_id=="{pack_id}")'
             f'|> last()'
@@ -245,7 +272,7 @@ def histories_data(pack_id, rng):
     start, every = RANGES.get(rng, RANGES["1h"])
     agg = f'|> aggregateWindow(every:{every}, fn:mean, createEmpty:false)' if every else ''
     flux = (
-        f'from(bucket:"{BUCKET}")'
+        f'from(bucket:"{bucket_for(pack_id)}")'
         f'|> range(start:{start})'
         f'|> filter(fn:(r)=> r._measurement=="telemetry" and r.pack_id=="{pack_id}")'
         f'{agg}'
@@ -265,7 +292,7 @@ def history_data(pack_id, field, rng):
     start, every = RANGES.get(rng, RANGES["1h"])
     agg = f'|> aggregateWindow(every:{every}, fn:mean, createEmpty:false)' if every else ''
     flux = (
-        f'from(bucket:"{BUCKET}")'
+        f'from(bucket:"{bucket_for(pack_id)}")'
         f'|> range(start:{start})'
         f'|> filter(fn:(r)=> r._measurement=="telemetry" and r.pack_id=="{pack_id}" and r._field=="{field}")'
         f'{agg}'
@@ -281,7 +308,7 @@ def track_data(pack_id, rng):
     start, every = RANGES.get(rng, RANGES["1h"])
     agg = f'|> aggregateWindow(every:{every}, fn:mean, createEmpty:false)' if every else ''
     flux = (
-        f'from(bucket:"{BUCKET}")'
+        f'from(bucket:"{bucket_for(pack_id)}")'
         f'|> range(start:{start})'
         f'|> filter(fn:(r)=> r._measurement=="telemetry" and r.pack_id=="{pack_id}"'
         f' and (r._field=="lat" or r._field=="lon"))'
