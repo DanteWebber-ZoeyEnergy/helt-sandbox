@@ -213,16 +213,24 @@ def influx_query(flux):
                  "Accept": "application/csv"})
     with urllib.request.urlopen(req, timeout=15) as r:
         text = r.read().decode()
+    # InfluxDB starts every table (or run of tables with one schema) with its
+    # own header row, and the column ORDER can differ between them -- e.g. in
+    # a union, aggregateWindow(fn:last) yields _time,_value,_field where
+    # fn:mean yields _time,_field,_value. So each header row replaces the
+    # current one; a header row is the one whose result/table columns read
+    # "result"/"table" (data rows carry "_result" and a table number).
     rows = []
-    for row in csv.DictReader(io.StringIO(text)):
-        vals = {k: v for k, v in row.items() if k}
-        if not any(vals.values()):
+    header = None
+    for cells in csv.reader(io.StringIO(text)):
+        if not any(cells):
             continue                                  # blank separator line
-        if all(v == k for k, v in vals.items()):
-            continue                                  # repeated header row:
-            # InfluxDB emits one header per result table, and DictReader turns
-            # every header after the first into a data row whose every value
-            # equals its own column name.
+        if len(cells) > 2 and cells[1] == "result" and cells[2] == "table":
+            header = cells
+            continue
+        if header is None:
+            continue
+        row = dict(zip(header, cells))
+        row.pop("", None)
         rows.append(row)
     return rows
 
@@ -254,7 +262,13 @@ def all_packs():
                 packs.append({"pack_id": pid,
                               "online": (now - last_seen) < 90,   # 3x fw batch period
                               "last_seen": last_seen})
-    packs.sort(key=lambda p: p["pack_id"])
+    # One entry per pack: a pack's points are split into one table per
+    # ts_synced tag value, so last() returns a row for each -- keep the newest.
+    newest = {}
+    for p in packs:
+        if p["pack_id"] not in newest or p["last_seen"] > newest[p["pack_id"]]["last_seen"]:
+            newest[p["pack_id"]] = p
+    packs = sorted(newest.values(), key=lambda p: p["pack_id"])
     return packs
 
 
