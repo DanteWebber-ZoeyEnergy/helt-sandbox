@@ -23,6 +23,13 @@
     --red-wash:rgba(194,60,51,.10);
     --green:   #65bc7b;              /* status only, always with a label */
     --radius:  10px;
+    /* categorical slots for multi-series charts and the map's network
+       position (dataviz reference order, validated on the #fff card
+       surface: adjacent CVD dE >= 9.1, normal-vision >= 19.6; s3-s5 are
+       under 3:1, so every multi-series chart carries a value legend).
+       The brand red stays the single-series data hue. */
+    --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100;
+    --s5: #e87ba4; --s6: #008300; --s7: #4a3aa7; --s8: #e34948;
   }
   * { box-sizing: border-box; }
   body {
@@ -115,6 +122,31 @@
   }
   .tooltip b { font-size: .92rem; }
   .tooltip .tt-time { color: rgba(255,255,255,.65); }
+  .tooltip .tt-row { display: flex; align-items: center; gap: .4rem; }
+  .tooltip .tt-row i { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+  .card[hidden] { display: none; }
+
+  /* ---- multi-series legend: key + name + current value. The value column
+     is the table view the lighter series hues need (text stays in ink). */
+  .legend { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+            gap: .1rem .9rem; margin-top: .3rem; font-size: .78rem; color: var(--ink-2); }
+  .legend .item { display: flex; align-items: center; gap: .4rem; min-width: 0; }
+  .legend .item[hidden] { display: none; }
+  .legend .key { width: 14px; height: 3px; border-radius: 2px; flex: none; }
+  .legend .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .legend .val { color: var(--ink); font-weight: 500; font-variant-numeric: tabular-nums; }
+
+  /* ---- faults list (firmware interval summary, 'ops' only) ---- */
+  .faults { list-style: none; margin: .2rem 0 .2rem; padding: 0; max-height: 196px;
+            overflow-y: auto; font-size: .82rem; }
+  .faults li { display: grid; grid-template-columns: 8.2rem 2.4rem 1fr; gap: .5rem;
+               padding: .32rem 0; border-top: 1px solid var(--grid); }
+  .faults .when { color: var(--ink-2); font-variant-numeric: tabular-nums; }
+  .faults .src { color: var(--muted); text-transform: uppercase; font-size: .72rem;
+                 letter-spacing: .06em; align-self: center; }
+  .faults .what code { margin-right: .35rem; }
+  .faults li.none { display: block; color: var(--muted); border: 0; padding: 2.2rem 0;
+                    text-align: center; }
 
   /* ---- map ---- */
   .map-card { margin-top: 1rem; background: var(--surface);
@@ -129,6 +161,16 @@
   #map { height: 380px; }
   .pack-marker { width: 14px; height: 14px; border-radius: 50%; background: var(--red);
                  border: 3px solid #fff; box-shadow: 0 0 0 1px var(--hairline); }
+  /* network position (AWS Device Location from WiFi / cell): a different
+     hue and a ring, so it never reads as a GNSS fix */
+  .net-marker { width: 14px; height: 14px; border-radius: 50%; background: var(--s1);
+                border: 3px solid #fff; box-shadow: 0 0 0 1px var(--hairline); }
+  .maplegend { display: flex; gap: .9rem; font-size: .78rem; color: var(--ink-2); }
+  .maplegend span[hidden] { display: none; }
+  .maplegend i { display: inline-block; width: 9px; height: 9px; border-radius: 50%;
+                 margin-right: .3rem; vertical-align: -1px; }
+  .maplegend i.gnss { background: var(--red); }
+  .maplegend i.net { background: var(--s1); box-shadow: 0 0 0 3px rgba(42,120,214,.18); }
 
   /* ---- login gate (spec S1 — a gate, not the future login UX) ---- */
   .login { position: fixed; inset: 0; z-index: 2000; background: var(--page);
@@ -234,7 +276,7 @@
   </div>
   <div class="spacer"></div>
   <select class="packsel" id="packSel" aria-label="Select pack"></select>
-  <span class="pill" id="packPill"><span class="dot"></span><span id="pid">—</span>&nbsp;<span id="stateTxt">connecting…</span></span>
+  <span class="pill" id="packPill"><span class="dot"></span><span id="pid">—</span>&nbsp;<span id="stateTxt">connecting…</span><span id="sysState"></span></span>
   <span class="updated" id="age">updated: never</span>
   <span class="whoami" id="whoami"></span>
   <button class="signout" id="signout" hidden>Sign out</button>
@@ -291,6 +333,10 @@
   <div class="map-card">
     <div class="head">
       <span class="label">Location</span>
+      <span class="maplegend">
+        <span id="lgGnss" hidden><i class="gnss"></i>GNSS</span>
+        <span id="lgNet" hidden><i class="net"></i>Network (WiFi / cell) ± accuracy</span>
+      </span>
       <span class="coords" id="coords">–</span>
     </div>
     <div id="map"></div>
@@ -413,8 +459,72 @@ const FIELDS = [
   { key: "dc_output_w",            label: "DC output",       unit: "W",   dec: 0 },
   { key: "ac_input_w",             label: "AC input",        unit: "W",   dec: 0 },
   { key: "solar_input_w",          label: "Solar input",     unit: "W",   dec: 0 },
+  // real packs, firmware interval summary: means over each 30 s window
+  { key: "batt_power_avg_w",       label: "Battery power · 30 s avg", unit: "W", dec: 0 },
+  { key: "ac_output_avg_w",        label: "AC output · 30 s avg",     unit: "W", dec: 0 },
+  { key: "dc_output_avg_w",        label: "DC output · 30 s avg",     unit: "W", dec: 0 },
+  // surges: each dot is a window with a surge (peak W); not a trend line
+  { key: "ac_surge_max_w",         label: "AC output surges · peak", unit: "W", dec: 0,
+    dots: true, countKey: "ac_surge_count" },
 ];
+// Multi-series cards (same unit, one axis). A series keeps its slot color
+// whether or not the others have data -- color follows the entity.
+const MULTI = [
+  { id: "inv_temps", label: "Inverter temperatures", unit: "°C", dec: 0, series: [
+    { key: "inv_igbt1_c",              label: "IGBT 1" },
+    { key: "inv_dcdc_fet_hs_c",        label: "DC-DC FET heatsink" },
+    { key: "inv_rectifier_diode_hs_c", label: "Rectifier diode heatsink" },
+    { key: "inv_filter_inductor_c",    label: "Filter inductor" },
+    { key: "inv_control_circuitry_c",  label: "Control circuitry" },
+    { key: "inv_ac_charger_hs_c",      label: "AC charger heatsink" },
+    { key: "inv_ntc5_c",               label: "IGBT 2 (NTC 5)" },
+    { key: "inv_ntc1_c",               label: "NTC 1" },
+  ] },
+  { id: "mppt_temps", label: "MPPT temperatures", unit: "°C", dec: 1, series: [
+    { key: "mppt_solar_temp_c", label: "Solar MPPT" },
+    { key: "mppt_ac_temp_c",    label: "AC charger MPPT" },
+  ] },
+];
+const SERIES_COLORS = ["--s1", "--s2", "--s3", "--s4", "--s5", "--s6", "--s7", "--s8"]
+  .map(v => `var(${v})`);
+// Pack state (CAN 0x100 bms_state, the system state the BMS owns).
+const STATE_NAMES = ["STORAGE", "SLEEP", "INIT", "STANDBY", "ACTIVE", "FAULT",
+                     "FAIL", "STORAGE CONFIRM"];
+const NET_SRC = { 1: "WiFi", 2: "cell tower", 3: "WiFi + cell" };
+// Fault codes -> names, from the firmware's error_manager.c table.
+const FAULT_NAMES = {
+  0x01: "Cell Under-Voltage", 0x02: "Cell Over-Voltage", 0x04: "Stack Over-Voltage",
+  0x05: "Over-Current Discharge", 0x06: "Over-Current Discharge Surge",
+  0x07: "Over-Current Charge", 0x08: "Short Circuit Detected",
+  0x09: "Derate Limit Exceeded (Discharge, Cold)", 0x0A: "Derate Limit Exceeded (Charge)",
+  0x0B: "Over-Temperature Charge", 0x0C: "Over-Temperature Discharge",
+  0x0D: "Under-Temperature Charge", 0x0E: "Under-Temperature Discharge",
+  0x0F: "FET Failure", 0x10: "AFE Communication Error", 0x11: "AFE Measurement Missed",
+  0x12: "State Integrity Failure", 0x13: "Over-Power Discharge", 0x14: "Over-Power Charge",
+  0x15: "Derate Limit Exceeded (Discharge, Warm)", 0x16: "Critical Cell Under-Voltage",
+  0x17: "Critical Cell Over-Voltage", 0x18: "Battery Thermal Runaway",
+  0x19: "Subsystem Communication Failure", 0x1A: "System Short Circuit",
+  0x1B: "Critical Measurement Failure", 0x1C: "Abnormal Operation",
+  0x20: "Inverter Fault", 0x21: "DC Board Fault",
+  0x40: "Inverter: Battery Undervoltage", 0x41: "Inverter: Battery Overvoltage",
+  0x42: "Inverter: Bus Undervoltage", 0x43: "Inverter: Bus Overvoltage",
+  0x44: "Inverter: Output Undervoltage", 0x45: "Inverter: Output Overvoltage",
+  0x46: "Inverter: Overcurrent", 0x47: "Inverter: Overtemperature",
+  0x48: "Inverter: Battery Fault", 0x49: "Inverter: Bus Fault", 0x4A: "Inverter: Slow Fault",
+  0x4B: "Inverter: Fast Fault", 0x4C: "Inverter: AC Output Fault",
+  0x4D: "Inverter: Communication Fault", 0x4E: "Inverter: System Fault",
+  0x4F: "Inverter: Bus Sustained OV", 0x50: "Inverter: Short Circuit",
+  0x51: "Inverter: Output Overload",
+  0x60: "DC Board: Over-Temperature", 0x61: "DC Board: Input Over-Voltage",
+  0x62: "DC Board: Input Under-Voltage", 0x63: "DC Board: Output Short Circuit",
+  0x64: "DC Board: USB-A Port Fault", 0x65: "DC Board: 12V Over-Current",
+  0x66: "DC Board: USB Over-Current", 0x67: "DC Board: Reverse Polarity",
+  0x68: "DC Board: AC Adapter Over-Voltage", 0x69: "DC Board: Solar Input Over-Voltage",
+  0x6A: "DC Board: Input Over-Current", 0x6B: "DC Board: Battery Bus Voltage Error",
+  0x6C: "DC Board: Battery Bus Over-Current",
+};
 const RANGES = ["15m", "1h", "6h", "24h", "7d"];
+const RANGE_S = { "15m": 900, "1h": 3600, "6h": 21600, "24h": 86400, "7d": 604800 };
 let range = "1h";
 
 const $ = id => document.getElementById(id);
@@ -448,6 +558,10 @@ class LineChart {
     new ResizeObserver(() => this.draw(this.data)).observe(this.svg);
   }
 
+  // dots: events, not a trend -- one marker per point, no line or area, on
+  // the selected range's time axis (a single event still plots)
+  get minPts() { return this.field.dots ? 1 : 2; }
+
   draw(series) {
     this.data = series || [];
     const W = this.svg.clientWidth || 340, H = 150;
@@ -455,11 +569,15 @@ class LineChart {
     this.svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
     this.svg.replaceChildren();
     this.geom = null;
-    this.empty.style.display = this.data.length < 2 ? "" : "none";
-    if (this.data.length < 2) return;
+    this.empty.style.display = this.data.length < this.minPts ? "" : "none";
+    if (this.data.length < this.minPts) return;
 
     const xs = this.data.map(p => p.t), ys = this.data.map(p => p.v);
-    const x0 = xs[0], x1 = xs[xs.length - 1];
+    let x0 = xs[0], x1 = xs[xs.length - 1];
+    if (this.field.dots) {
+      x1 = Math.max(x1, Date.now() / 1000);
+      x0 = Math.min(x0, x1 - (RANGE_S[range] || 3600));
+    }
     let lo = Math.min(...ys), hi = Math.max(...ys);
     if (lo === hi) { lo -= 1; hi += 1; }
     const pad = (hi - lo) * 0.08; lo -= pad; hi += pad;
@@ -486,15 +604,23 @@ class LineChart {
                              "font-size": 10.5, fill: "var(--muted)" });
       t.textContent = timeFmt(ts, x1 - x0);
     }
-    // area wash + 2px line + end marker (surface ring via stroke)
-    const pts = this.data.map(p => `${X(p.t).toFixed(1)},${Y(p.v).toFixed(1)}`);
-    el("path", { d: `M${pts.join("L")}L${X(x1).toFixed(1)},${H - M.b}L${M.l},${H - M.b}Z`,
-                 fill: "var(--red-wash)", stroke: "none" });
-    el("path", { d: `M${pts.join("L")}`, fill: "none", stroke: "var(--red)",
-                 "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" });
-    const lastP = this.data[this.data.length - 1];
-    el("circle", { cx: X(lastP.t), cy: Y(lastP.v), r: 4, fill: "var(--red)",
-                   stroke: "var(--surface)", "stroke-width": 2 });
+    if (this.field.dots) {
+      // one 8px marker per event, surface ring so neighbours stay separate
+      for (const p of this.data) {
+        el("circle", { cx: X(p.t), cy: Y(p.v), r: 4, fill: "var(--red)",
+                       stroke: "var(--surface)", "stroke-width": 2 });
+      }
+    } else {
+      // area wash + 2px line + end marker (surface ring via stroke)
+      const pts = this.data.map(p => `${X(p.t).toFixed(1)},${Y(p.v).toFixed(1)}`);
+      el("path", { d: `M${pts.join("L")}L${X(x1).toFixed(1)},${H - M.b}L${M.l},${H - M.b}Z`,
+                   fill: "var(--red-wash)", stroke: "none" });
+      el("path", { d: `M${pts.join("L")}`, fill: "none", stroke: "var(--red)",
+                   "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" });
+      const lastP = this.data[this.data.length - 1];
+      el("circle", { cx: X(lastP.t), cy: Y(lastP.v), r: 4, fill: "var(--red)",
+                     stroke: "var(--surface)", "stroke-width": 2 });
+    }
     // crosshair (hidden until hover)
     this.cross = el("line", { x1: 0, x2: 0, y1: M.t, y2: H - M.b,
                               stroke: "var(--hairline)", "stroke-width": 1, opacity: 0 });
@@ -503,7 +629,7 @@ class LineChart {
   }
 
   hover(e) {
-    if (!e || !this.geom || this.data.length < 2) {
+    if (!e || !this.geom || this.data.length < this.minPts) {
       if (this.cross) { this.cross.setAttribute("opacity", 0); this.dot.setAttribute("opacity", 0); }
       this.tip.style.opacity = 0;
       return;
@@ -525,6 +651,7 @@ class LineChart {
     this.tip.replaceChildren();
     const b = document.createElement("b");
     b.textContent = `${fmt(best.v, f.dec)} ${f.unit}`;
+    if (best.n != null) b.textContent += ` · ${best.n} surge${best.n === 1 ? "" : "s"}`;
     const tm = document.createElement("span");
     tm.className = "tt-time";
     tm.textContent = " " + new Date(best.t * 1000).toLocaleString([],
@@ -535,6 +662,179 @@ class LineChart {
     this.tip.style.opacity = 1;
   }
 }
+
+/* ------------- SVG multi-line chart (same unit, one y-axis) ---------------
+   2px lines in the categorical slots, a value legend below (key + name +
+   current value -- the table view), crosshair tooltip listing every series
+   at the hovered time. Series with no data drop out of plot and legend. */
+class MultiLineChart {
+  constructor(card, spec) {
+    this.spec = spec;
+    this.series = spec.series.map((s, i) => ({ ...s, color: SERIES_COLORS[i] }));
+    this.svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    card.appendChild(this.svg);
+    this.tip = document.createElement("div");
+    this.tip.className = "tooltip";
+    card.appendChild(this.tip);
+    this.empty = document.createElement("div");
+    this.empty.className = "empty";
+    this.empty.textContent = "no data in range";
+    this.empty.style.display = "none";
+    card.appendChild(this.empty);
+    this.legend = document.createElement("div");
+    this.legend.className = "legend";
+    for (const s of this.series) {
+      const it = document.createElement("span");
+      it.className = "item"; it.hidden = true;
+      const k = document.createElement("i");
+      k.className = "key"; k.style.background = s.color;
+      const n = document.createElement("span");
+      n.className = "name"; n.textContent = s.label;
+      const v = document.createElement("span");
+      v.className = "val"; v.textContent = "–";
+      it.append(k, n, v);
+      this.legend.appendChild(it);
+      s.item = it; s.val = v;
+    }
+    card.appendChild(this.legend);
+    this.data = {};
+    this.now = {};
+    this.svg.addEventListener("pointermove", e => this.hover(e));
+    this.svg.addEventListener("pointerleave", () => this.hover(null));
+    new ResizeObserver(() => this.draw(this.data)).observe(this.svg);
+  }
+
+  hasData() {
+    return this.series.some(s => (this.data[s.key] || []).length || this.now[s.key] != null);
+  }
+
+  // current values from /latest -> the legend's value column
+  setNow(t) {
+    this.now = {};
+    for (const s of this.series) {
+      const v = t[s.key];
+      this.now[s.key] = v == null ? null : v;
+      s.val.textContent = v == null ? "–" : `${fmt(v, this.spec.dec)} ${this.spec.unit}`;
+    }
+    this.syncLegend();
+  }
+
+  syncLegend() {
+    for (const s of this.series) {
+      s.item.hidden = !((this.data[s.key] || []).length || this.now[s.key] != null);
+    }
+  }
+
+  draw(byKey) {
+    this.data = byKey || {};
+    this.syncLegend();
+    const W = this.svg.clientWidth || 340, H = 150;
+    const M = { l: 44, r: 12, t: 8, b: 22 };
+    this.svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+    this.svg.replaceChildren();
+    this.geom = null;
+    const live = this.series.filter(s => (this.data[s.key] || []).length >= 2);
+    this.empty.style.display = live.length ? "none" : "";
+    if (!live.length) return;
+
+    let x0 = Infinity, x1 = -Infinity, lo = Infinity, hi = -Infinity;
+    for (const s of live) {
+      const pts = this.data[s.key];
+      x0 = Math.min(x0, pts[0].t); x1 = Math.max(x1, pts[pts.length - 1].t);
+      for (const p of pts) { lo = Math.min(lo, p.v); hi = Math.max(hi, p.v); }
+    }
+    if (lo === hi) { lo -= 1; hi += 1; }
+    const pad = (hi - lo) * 0.08; lo -= pad; hi += pad;
+    const X = t => M.l + (t - x0) / (x1 - x0 || 1) * (W - M.l - M.r);
+    const Y = v => H - M.b - (v - lo) / (hi - lo) * (H - M.t - M.b);
+    this.geom = { X, Y, live };
+
+    const NS = this.svg.namespaceURI;
+    const el = (n, at) => { const e = document.createElementNS(NS, n);
+      for (const k in at) e.setAttribute(k, at[k]); this.svg.appendChild(e); return e; };
+
+    for (const v of niceTicks(lo, hi, 4)) {
+      if (v < lo || v > hi) continue;
+      el("line", { x1: M.l, x2: W - M.r, y1: Y(v), y2: Y(v),
+                   stroke: "var(--grid)", "stroke-width": 1 });
+      const t = el("text", { x: M.l - 7, y: Y(v) + 3.5, "text-anchor": "end",
+                             "font-size": 10.5, fill: "var(--muted)" });
+      t.textContent = tickFmt(v);
+    }
+    for (const ts of timeTicks(x0, x1, 5)) {
+      const t = el("text", { x: X(ts), y: H - 6, "text-anchor": "middle",
+                             "font-size": 10.5, fill: "var(--muted)" });
+      t.textContent = timeFmt(ts, x1 - x0);
+    }
+    for (const s of live) {
+      const pts = this.data[s.key].map(p => `${X(p.t).toFixed(1)},${Y(p.v).toFixed(1)}`);
+      el("path", { d: `M${pts.join("L")}`, fill: "none", stroke: s.color,
+                   "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" });
+    }
+    this.cross = el("line", { x1: 0, x2: 0, y1: M.t, y2: H - M.b,
+                              stroke: "var(--hairline)", "stroke-width": 1, opacity: 0 });
+    this.dots = live.map(s => el("circle", { r: 4, fill: s.color, stroke: "var(--surface)",
+                                             "stroke-width": 2, opacity: 0 }));
+  }
+
+  hover(e) {
+    if (!e || !this.geom) {
+      if (this.cross) {
+        this.cross.setAttribute("opacity", 0);
+        for (const d of this.dots) d.setAttribute("opacity", 0);
+      }
+      this.tip.style.opacity = 0;
+      return;
+    }
+    const { X, Y, live } = this.geom;
+    const r = this.svg.getBoundingClientRect();
+    const mx = e.clientX - r.left;
+    // snap to the nearest sample time of any series, then each series' point nearest it
+    let bt = null, bd = Infinity;
+    for (const s of live) for (const p of this.data[s.key]) {
+      const d = Math.abs(X(p.t) - mx);
+      if (d < bd) { bd = d; bt = p.t; }
+    }
+    if (bt == null) return;
+    const px = X(bt);
+    this.cross.setAttribute("x1", px); this.cross.setAttribute("x2", px);
+    this.cross.setAttribute("opacity", 1);
+    this.tip.replaceChildren();
+    const rows = [];
+    live.forEach((s, i) => {
+      let best = null, d0 = Infinity;
+      for (const p of this.data[s.key]) {
+        const d = Math.abs(p.t - bt);
+        if (d < d0) { d0 = d; best = p; }
+      }
+      const dot = this.dots[i];
+      if (best) {
+        dot.setAttribute("cx", X(best.t)); dot.setAttribute("cy", Y(best.v));
+        dot.setAttribute("opacity", 1);
+        rows.push({ s, v: best.v });
+      } else dot.setAttribute("opacity", 0);
+    });
+    rows.sort((a, b) => b.v - a.v);                 // hottest first
+    for (const { s, v } of rows) {
+      const row = document.createElement("div");
+      row.className = "tt-row";
+      const k = document.createElement("i"); k.style.background = s.color;
+      const txt = document.createElement("span");
+      txt.textContent = `${s.label}  ${fmt(v, this.spec.dec)} ${this.spec.unit}`;
+      row.append(k, txt);
+      this.tip.appendChild(row);
+    }
+    const tm = document.createElement("div");
+    tm.className = "tt-time";
+    tm.textContent = new Date(bt * 1000).toLocaleString([],
+      { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+    this.tip.appendChild(tm);
+    this.tip.style.left = `${px}px`;
+    this.tip.style.top = `${M_TOP_TIP}px`;
+    this.tip.style.opacity = 1;
+  }
+}
+const M_TOP_TIP = 150;   // multi-series tooltip: below the plot, clear of the lines
 
 function niceTicks(lo, hi, n) {
   const span = hi - lo, raw = span / n;
@@ -559,20 +859,42 @@ const timeFmt = (ts, span) => {
 };
 
 /* ------------------------------- build UI -------------------------------- */
-const charts = {};
-for (const f of FIELDS) {
+const charts = {}, multis = {}, cards = {};
+function makeCard(id, labelText) {
   const card = document.createElement("div");
   card.className = "card";
+  card.hidden = true;                       // shown once the pack has this data
   const head = document.createElement("div");
   head.className = "head";
   const label = document.createElement("span");
-  label.className = "label"; label.textContent = f.label;
+  label.className = "label"; label.textContent = labelText;
   const now = document.createElement("span");
-  now.className = "now"; now.id = `now_${f.key}`;
+  now.className = "now"; now.id = `now_${id}`;
   head.append(label, now);
   card.appendChild(head);
   $("charts").appendChild(card);
-  charts[f.key] = new LineChart(card, f);
+  cards[id] = card;
+  return card;
+}
+for (const f of FIELDS) charts[f.key] = new LineChart(makeCard(f.key, f.label), f);
+for (const m of MULTI) multis[m.id] = new MultiLineChart(makeCard(m.id, m.label), m);
+
+// Faults ('ops' only): the pack's faults in the range, newest first.
+const faultCard = makeCard("faults", "Faults");
+const faultList = document.createElement("ul");
+faultList.className = "faults";
+faultCard.appendChild(faultList);
+let faultsAllowed = true;                   // false after a 403: not entitled
+
+// A card shows when the selected pack has that data -- in the history range
+// or in its latest values -- so a real pack and a sandbox fake each show
+// their own fields instead of a wall of empty charts.
+let latestT = {};
+function syncCards() {
+  for (const f of FIELDS) {
+    cards[f.key].hidden = !(charts[f.key].data.length || latestT[f.key] != null);
+  }
+  for (const m of MULTI) cards[m.id].hidden = !multis[m.id].hasData();
 }
 
 for (const r of RANGES) {
@@ -596,6 +918,13 @@ const trail = L.polyline([], { color: "#c23c33", weight: 3, opacity: .8 }).addTo
 const marker = L.marker([-33.9249, 18.4241],
   { icon: L.divIcon({ className: "", html: '<div class="pack-marker"></div>',
                       iconSize: [14, 14], iconAnchor: [7, 7] }) }).addTo(map);
+// Network position (AWS IoT Core Device Location from WiFi networks and/or
+// the serving cell; only while the GNSS has no usable fix): a blue marker
+// inside its 68 % accuracy circle, plus each distinct earlier position in the
+// range as a faint circle -- kept apart from the red GNSS trail.
+const NET_STYLE = { color: "#2a78d6", weight: 1.5, opacity: .7, fillOpacity: .10 };
+const netTrail = L.layerGroup().addTo(map);
+const netNow = L.layerGroup().addTo(map);
 let mapFitted = false;
 const mapCard = document.querySelector(".map-card");
 function setMapVisible(v) {
@@ -638,20 +967,29 @@ async function pollLatest() {
     lastUpdatedTs = d.updated_ts || null;
     renderAge();
 
+    latestT = t;
+    const tts = d.telemetry_ts || null;     // per-field times (absent on an old Lambda)
+    $("sysState").textContent = t.bms_state != null && STATE_NAMES[t.bms_state]
+      ? ` · ${STATE_NAMES[t.bms_state]}` : "";
+
     $("k_soc").textContent = fmt(t.soc_pct, 0);
     $("socMeter").style.width = `${Math.min(100, Math.max(0, t.soc_pct ?? 0))}%`;
-    // net = ports in - ports out; standby drain isn't metered, so ~0 = idle
-    const netW = (t.total_input_w == null && t.total_output_w == null) ? null
-               : (t.total_input_w ?? 0) - (t.total_output_w ?? 0);
+    // net = ports in - ports out (sandbox fakes); a real pack reports the
+    // battery's own power as a 30 s mean. Standby drain isn't metered, so ~0 = idle
+    const ports = !(t.total_input_w == null && t.total_output_w == null);
+    const netW = ports ? (t.total_input_w ?? 0) - (t.total_output_w ?? 0)
+               : (t.batt_power_avg_w ?? null);
     $("k_power").textContent = fmt(netW, 0);
-    $("k_powerNote").textContent = netW == null ? "" :
-      netW > 30 ? "▲ charging" : netW < -30 ? "▼ discharging" : "idle";
+    $("k_powerNote").textContent = (netW == null ? "" :
+      netW > 30 ? "▲ charging" : netW < -30 ? "▼ discharging" : "idle") +
+      (!ports && netW != null ? " · 30 s avg" : "");
     $("k_soh").textContent = fmt(t.soh_pct, 1);
     $("k_sohNote").textContent = t.max_cell_temp_c != null
       ? `max cell ${fmt(t.max_cell_temp_c, 1)} °C` : "";
     $("k_cycles").textContent = t.cycle_count ?? "–";
 
     for (const f of FIELDS) {
+      if (f.dots) continue;                 // its header is the count in range
       const n = $(`now_${f.key}`);
       n.replaceChildren();
       n.append(fmt(t[f.key], f.dec));
@@ -659,15 +997,9 @@ async function pollLatest() {
       u.className = "unit"; u.textContent = ` ${f.unit}`;
       n.appendChild(u);
     }
-
-    // no lat/lon = no location entitlement (or no GPS data): hide the map
-    setMapVisible(t.lat != null && t.lon != null);
-    if (t.lat != null && t.lon != null) {
-      marker.setLatLng([t.lat, t.lon]);
-      $("coords").textContent =
-        `${Number(t.lat).toFixed(5)}, ${Number(t.lon).toFixed(5)}`;
-      if (!mapFitted) { map.setView([t.lat, t.lon], 15); mapFitted = true; }
-    }
+    for (const m of MULTI) multis[m.id].setNow(t);
+    syncCards();
+    renderPosition(t, tts, d.updated_ts);
     setErr("latest", "");
   } catch (e) {
     setErr("latest", "⚠ " + e.message +
@@ -675,18 +1007,128 @@ async function pollLatest() {
   }
 }
 
+// Where is the pack now? The GNSS fix (red) and/or the network position
+// (blue, with its accuracy circle). A value counts as current only if it came
+// with the newest sample: the firmware drops net_* once the GNSS has a usable
+// fix (and lat/lon while it has none), so an older one is history, not "now".
+function renderPosition(t, tts, updated) {
+  const hasG = t.lat != null && t.lon != null;
+  const hasN = t.net_lat != null && t.net_lon != null;
+  // no position fields = no location entitlement (or no data): hide the map
+  setMapVisible(hasG || hasN);
+  const cur = k => !tts || !updated || (tts[k] != null && tts[k] >= updated - 2);
+  const gNow = hasG && cur("lat");
+  const nNow = hasN && cur("net_lat");
+  $("lgGnss").hidden = !hasG;
+  $("lgNet").hidden = !hasN;
+
+  if (hasG) marker.setLatLng([t.lat, t.lon]);
+  // no fix at all hides the GNSS marker; a stale one fades behind a current
+  // network position
+  marker.setOpacity(!hasG ? 0 : (gNow || !nNow) ? 1 : .35);
+  netNow.clearLayers();
+  const parts = [];
+  if (hasG) parts.push(`${Number(t.lat).toFixed(5)}, ${Number(t.lon).toFixed(5)}` +
+                       (gNow ? "" : " (last GNSS fix)"));
+  if (nNow) {
+    const acc = Number(t.net_acc_m ?? 0);
+    L.circle([t.net_lat, t.net_lon], { ...NET_STYLE, radius: acc }).addTo(netNow);
+    L.marker([t.net_lat, t.net_lon], { icon: L.divIcon({ className: "",
+      html: '<div class="net-marker"></div>', iconSize: [14, 14], iconAnchor: [7, 7] }) })
+      .addTo(netNow);
+    const age = t.net_age_s != null ? `, measured ${Math.round(t.net_age_s / 60)} min ago` : "";
+    parts.push(`network ${Number(t.net_lat).toFixed(4)}, ${Number(t.net_lon).toFixed(4)}` +
+               ` ± ${fmt(acc, 0)} m (${NET_SRC[t.net_src] || "?"}${age})`);
+  }
+  $("coords").textContent = parts.join(" · ") || "–";
+  if (!mapFitted && (gNow || nNow || hasG)) {
+    if (nNow && !gNow) map.setView([t.net_lat, t.net_lon], 15);
+    else map.setView([t.lat, t.lon], 15);
+    mapFitted = true;
+  }
+}
+
 let bundledApi = true;   // flips off if the deployed Lambda predates /histories
 
 function applyBundle(series) {
-  for (const f of FIELDS) charts[f.key].draw(series[f.key] || []);
+  for (const f of FIELDS) {
+    let pts = series[f.key] || [];
+    if (f.countKey) {                       // surges: attach the window's count
+      const n = new Map((series[f.countKey] || []).map(p => [p.t, p.v]));
+      pts = pts.map(p => ({ ...p, n: n.get(p.t) }));
+      const total = (series[f.countKey] || []).reduce((a, p) => a + (p.v || 0), 0);
+      $(`now_${f.key}`).textContent = series[f.countKey]
+        ? `${total} surge${total === 1 ? "" : "s"}` : "";
+    }
+    charts[f.key].draw(pts);
+  }
+  for (const m of MULTI) {
+    const by = {};
+    for (const s of m.series) if (series[s.key]) by[s.key] = series[s.key];
+    multis[m.id].draw(by);
+  }
+  syncCards();
+  // the surge card also shows while the pack reports counts (0 surges is news)
+  const sf = FIELDS.find(f => f.countKey);
+  if (sf && (series[sf.countKey] || []).length) cards[sf.key].hidden = false;
+
   const lonByT = new Map((series.lon || []).map(p => [p.t, p.v]));
   const pts = (series.lat || [])
     .filter(p => lonByT.has(p.t))
     .map(p => [p.v, lonByT.get(p.t)]);
   trail.setLatLngs(pts);
-  if (pts.length && !mapFitted) {
-    map.fitBounds(trail.getBounds(), { maxZoom: 16, padding: [30, 30] });
+
+  // network positions in the range: one faint circle per distinct position
+  // (the pack reports the same one in every sample while it holds)
+  netTrail.clearLayers();
+  const nLon = new Map((series.net_lon || []).map(p => [p.t, p.v]));
+  const nAcc = new Map((series.net_acc_m || []).map(p => [p.t, p.v]));
+  const seen = new Set();
+  const netPts = [];
+  for (const p of series.net_lat || []) {
+    if (!nLon.has(p.t)) continue;
+    const lat = p.v, lon = nLon.get(p.t), acc = nAcc.get(p.t) ?? 0;
+    const key = `${lat.toFixed(5)},${lon.toFixed(5)},${Math.round(acc)}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    netPts.push([lat, lon]);
+    L.circle([lat, lon], { ...NET_STYLE, opacity: .35, fillOpacity: .04, radius: acc })
+      .addTo(netTrail);
+  }
+  if ((pts.length || netPts.length) && !mapFitted) {
+    map.fitBounds(L.latLngBounds([...pts, ...netPts]), { maxZoom: 16, padding: [30, 30] });
     mapFitted = true;
+  }
+}
+
+// Faults ('ops'): a list, not a chart -- each row is one fault as raised.
+async function loadFaults() {
+  if (!faultsAllowed) return;
+  try {
+    const d = await getJSON(`/packs/${PACK}/faults?range=${range}`);
+    const rows = d.faults || [];
+    faultCard.hidden = false;
+    $("now_faults").textContent = `${rows.length}${rows.length >= 200 ? "+" : ""} in range`;
+    faultList.replaceChildren(...(rows.length ? rows.map(f => {
+      const li = document.createElement("li");
+      const when = document.createElement("span");
+      when.className = "when";
+      when.textContent = new Date(f.t * 1000).toLocaleString([],
+        { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit" });
+      const src = document.createElement("span");
+      src.className = "src"; src.textContent = f.src;
+      const what = document.createElement("span");
+      what.className = "what";
+      const c = document.createElement("code"); c.textContent = f.code;
+      what.append(c, FAULT_NAMES[parseInt(f.code, 16)] || "Unknown fault");
+      li.append(when, src, what);
+      return li;
+    }) : [Object.assign(document.createElement("li"),
+                        { className: "none", textContent: "No faults in this range" })]));
+  } catch (e) {
+    if (String(e.message).startsWith("403")) { faultsAllowed = false; faultCard.hidden = true; }
+    else if (String(e.message).includes("404")) { faultsAllowed = false; }   // Lambda predates /faults
+    else console.warn("faults:", e);
   }
 }
 
@@ -694,6 +1136,7 @@ async function refreshHistory() {
   if (!auth) return;
   $("charts").classList.add("loading");
   const failed = [];
+  loadFaults();                             // its own call, alongside the bundle
   try {
     // preferred: every field + the GPS trail in ONE API call (one InfluxDB
     // query server-side — the query bill is the dominant cost)
@@ -723,6 +1166,7 @@ async function refreshHistory() {
       }
     }).catch(e => { failed.push("track"); console.warn("track:", e); }));
     await pool(jobs, 4);
+    syncCards();
   } finally {
     $("charts").classList.remove("loading");
     if (failed.length) setErr("history",
@@ -753,7 +1197,16 @@ $("packSel").addEventListener("change", () => {
   PACK = $("packSel").value;
   localStorage.setItem("helt_pack", PACK);
   for (const f of FIELDS) charts[f.key].draw([]);   // new context — clear, don't blend
+  for (const m of MULTI) { multis[m.id].setNow({}); multis[m.id].draw({}); }
+  latestT = {};
+  syncCards();
+  faultsAllowed = true;                             // entitlement is per pack
+  faultCard.hidden = true;
+  faultList.replaceChildren();
+  $("sysState").textContent = "";
   trail.setLatLngs([]);
+  netTrail.clearLayers();
+  netNow.clearLayers();
   mapFitted = false;                                // re-center on the new pack
   lastUpdatedTs = null;
   pollLatest();

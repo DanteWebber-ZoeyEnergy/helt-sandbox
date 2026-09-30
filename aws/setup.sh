@@ -204,7 +204,7 @@ step8() {  # JWT authorizer + explicit routes + CORS lockdown (spec §6, S1)
     --query "Items[0].IntegrationId" --output text)
   for rk in "GET /packs" "GET /packs/{pack_id}/latest" \
             "GET /packs/{pack_id}/histories" "GET /packs/{pack_id}/history" \
-            "GET /packs/{pack_id}/track"; do
+            "GET /packs/{pack_id}/track" "GET /packs/{pack_id}/faults"; do
     rid=$(aws apigatewayv2 get-routes --api-id "$API_ID" --region "$REGION" \
       --query "Items[?RouteKey=='$rk'].RouteId | [0]" --output text)
     if [ "$rid" = "None" ] || [ -z "$rid" ]; then

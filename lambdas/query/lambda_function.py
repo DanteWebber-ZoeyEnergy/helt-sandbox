@@ -20,6 +20,8 @@ Routes (all require `Authorization: Bearer <access token>`):
         -> one field (403 unless the field is in an entitled group)
     GET /packs/{pack_id}/track?range=1h
         -> GPS trail (requires the 'location' group)
+    GET /packs/{pack_id}/faults?range=1h
+        -> the pack's faults, newest first (requires the 'ops' group)
 
 Cost rule (spec §5): the in-container cache stores the RAW InfluxDB read,
 keyed by pack/range only -- NEVER per user -- and entitlement filtering is
@@ -79,16 +81,41 @@ FIELD_GROUPS = {
     # core = customer-facing performance; ops = internal electricals +
     # diagnostics (voltage/current/cell-temp/protections live there since
     # 2026-08-03); health = wear + ambient environment.
+    # Firmware Phase L3 (2026-09-30): the 30 s interval means are core; the
+    # surges, faults, component temperatures and the v1 instantaneous power
+    # fields are ops; the network position (net_*) is location.
     "core":     {"soc_pct", "total_input_w", "total_output_w",
-                 "ac_output_w", "dc_output_w", "ac_input_w", "solar_input_w"},
+                 "ac_output_w", "dc_output_w", "ac_input_w", "solar_input_w",
+                 "batt_power_avg_w", "ac_output_avg_w", "dc_output_avg_w"},
     "health":   {"soh_pct", "cycle_count", "enclosure_temp_c",
                  "enclosure_humidity_pct"},
-    "location": {"lat", "lon"},
+    "location": {"lat", "lon",
+                 "net_lat", "net_lon", "net_acc_m", "net_src", "net_age_s"},
     "ops":      {"si_state", "bms_state", "seq", "ts_synced",
                  "pack_voltage_v", "current_a", "max_cell_temp_c",
-                 "bms_protections"},
+                 "bms_protections",
+                 "power_w", "inv_output_w", "dc_input_w",
+                 "interval_s", "ac_surge_count", "ac_surge_max_w", "fault_count",
+                 "inv_filter_inductor_c", "inv_ntc1_c", "inv_control_circuitry_c",
+                 "inv_rectifier_diode_hs_c", "inv_igbt1_c", "inv_ntc5_c",
+                 "inv_dcdc_fet_hs_c", "inv_ac_charger_hs_c",
+                 "mppt_solar_temp_c", "mppt_ac_temp_c"},
 }
 ALL_FIELDS = set().union(*FIELD_GROUPS.values())
+
+# How a field is downsampled for ranges beyond 15m (aggregateWindow). Counts
+# add up, a peak stays a peak, and a state or a source code is taken as it
+# stood at the end of the window -- a mean of any of those would be a value
+# the pack never reported. Everything else is a mean.
+AGG_FN = {
+    "ac_surge_count": "sum", "fault_count": "sum",
+    "ac_surge_max_w": "max",
+    "si_state": "last", "bms_state": "last", "net_src": "last",
+}
+
+# The faults route (pack_fault measurement, one point per fault) needs 'ops'.
+FAULTS_GROUP = "ops"
+FAULTS_LIMIT = 200
 
 # Per-container response cache. InfluxDB bills per query execution ($0.012/100)
 # which dwarfs every other per-request cost, so N viewers polling the same pack
@@ -239,13 +266,21 @@ def latest_data(pack_id, include_status):
         f'|> filter(fn:(r)=> r._measurement=="telemetry" and r.pack_id=="{pack_id}")'
         f'|> last()'
     )
+    # telemetry_ts: when each field was last reported. Fields are not all in
+    # every sample (the interval summary rides one sample per 30 s, the GNSS
+    # and network positions come and go), so "latest" alone cannot say
+    # whether a value is current -- the dashboard compares these with
+    # updated_ts, e.g. to tell which position is where the pack is now.
     telemetry = {}
+    telemetry_ts = {}
     newest = 0
     for r in influx_query(flux):
         f, v = r.get("_field"), r.get("_value")
+        t = _iso_to_epoch(r.get("_time", ""))
         if f and v not in (None, ""):
             telemetry[f] = _num(v)
-        newest = max(newest, _iso_to_epoch(r.get("_time", "")))
+            telemetry_ts[f] = t
+        newest = max(newest, t)
 
     # status costs a second InfluxDB query and liveness now comes from
     # telemetry freshness, so it's opt-in (?status=1, 'ops' group). 30d
@@ -264,18 +299,49 @@ def latest_data(pack_id, include_status):
             if f and v not in (None, ""):
                 status[f] = _num(v)
 
-    return {"updated_ts": newest, "telemetry": telemetry, "status": status}
+    return {"updated_ts": newest, "telemetry": telemetry,
+            "telemetry_ts": telemetry_ts, "status": status}
+
+
+def _field_is(fields, negate=False):
+    """Flux predicate on r._field for a set of KNOWN field names (constants
+    from AGG_FN, never user input): an or-chain, or its negation."""
+    if negate:
+        return " and ".join(f'r._field!="{f}"' for f in sorted(fields))
+    return " or ".join(f'r._field=="{f}"' for f in sorted(fields))
+
+
+def _downsampled(base, every):
+    """Flux for `base` (a stream expression) aggregated per window with each
+    field's AGG_FN -- still ONE query: the branches are unioned server-side.
+    `every` None = raw points (the 15m range)."""
+    if not every:
+        return base
+    by_fn = {}
+    for f, fn in AGG_FN.items():
+        by_fn.setdefault(fn, set()).add(f)
+    lines = [f'base = {base}',
+             f'mean_ = base |> filter(fn:(r)=> {_field_is(AGG_FN, negate=True)})'
+             f' |> aggregateWindow(every:{every}, fn:mean, createEmpty:false)']
+    names = ["mean_"]
+    for fn in sorted(by_fn):
+        lines.append(f'{fn}_ = base |> filter(fn:(r)=> {_field_is(by_fn[fn])})'
+                     f' |> aggregateWindow(every:{every}, fn:{fn}, createEmpty:false)')
+        names.append(f"{fn}_")
+    lines.append(f'union(tables:[{", ".join(names)}])')
+    return "\n".join(lines)
 
 
 def histories_data(pack_id, rng):
     """Every telemetry field for one pack in ONE Flux query."""
     start, every = RANGES.get(rng, RANGES["1h"])
-    agg = f'|> aggregateWindow(every:{every}, fn:mean, createEmpty:false)' if every else ''
-    flux = (
+    base = (
         f'from(bucket:"{bucket_for(pack_id)}")'
         f'|> range(start:{start})'
         f'|> filter(fn:(r)=> r._measurement=="telemetry" and r.pack_id=="{pack_id}")'
-        f'{agg}'
+    )
+    flux = (
+        f'{_downsampled(base, every)}'
         f'|> keep(columns:["_time","_field","_value"])'
     )
     series = {}
@@ -290,7 +356,8 @@ def histories_data(pack_id, rng):
 
 def history_data(pack_id, field, rng):
     start, every = RANGES.get(rng, RANGES["1h"])
-    agg = f'|> aggregateWindow(every:{every}, fn:mean, createEmpty:false)' if every else ''
+    fn = AGG_FN.get(field, "mean")
+    agg = f'|> aggregateWindow(every:{every}, fn:{fn}, createEmpty:false)' if every else ''
     flux = (
         f'from(bucket:"{bucket_for(pack_id)}")'
         f'|> range(start:{start})'
@@ -321,6 +388,27 @@ def track_data(pack_id, rng):
               if r.get("_time") and r.get("lat") not in (None, "") and r.get("lon") not in (None, "")]
     series.sort(key=lambda p: p["t"])
     return series
+
+
+def faults_data(pack_id, rng):
+    """The pack's faults in the range, newest first (firmware Phase L3: one
+    pack_fault point per fault, dated when it was raised; tags src + code).
+    Never downsampled -- each row is an event -- and capped at FAULTS_LIMIT."""
+    start, _ = RANGES.get(rng, RANGES["1h"])
+    flux = (
+        f'from(bucket:"{bucket_for(pack_id)}")'
+        f'|> range(start:{start})'
+        f'|> filter(fn:(r)=> r._measurement=="pack_fault" and r.pack_id=="{pack_id}"'
+        f' and r._field=="n")'
+        f'|> keep(columns:["_time","src","code"])'
+        f'|> group()'
+        f'|> sort(columns:["_time"], desc:true)'
+        f'|> limit(n:{FAULTS_LIMIT})'
+    )
+    out = [{"t": _iso_to_epoch(r["_time"]), "src": r.get("src", ""), "code": r.get("code", "")}
+           for r in influx_query(flux) if r.get("_time")]
+    out.sort(key=lambda p: p["t"], reverse=True)
+    return out
 
 
 # ---- request handling: authorize, read through the cache, filter, audit ----
@@ -376,6 +464,8 @@ def _handle(event, audit):
                 "pack_id": pack_id, "updated_ts": data["updated_ts"],
                 "telemetry": {k: v for k, v in data["telemetry"].items()
                               if k in allowed},
+                "telemetry_ts": {k: v for k, v in data["telemetry_ts"].items()
+                                 if k in allowed},
                 "status": data["status"] if inc else {}})
 
         if kind == "histories":
@@ -408,9 +498,17 @@ def _handle(event, audit):
             audit["decision"] = "allow"
             return reply(200, {"pack_id": pack_id, "series": data})
 
+        if kind == "faults":
+            if FAULTS_GROUP not in groups:
+                return reply(403, {"error": "forbidden"})
+            data = cached(("faults", pack_id, rng),
+                          lambda: faults_data(pack_id, rng))
+            audit["decision"] = "allow"
+            return reply(200, {"pack_id": pack_id, "range": rng, "faults": data})
+
     audit["route"] = "unknown"
     return reply(404, {"error": "not found",
-                       "hint": "GET /packs | /packs/{id}/latest | /packs/{id}/histories?range=1h | /packs/{id}/history?field=..&range=1h | /packs/{id}/track?range=1h"})
+                       "hint": "GET /packs | /packs/{id}/latest | /packs/{id}/histories?range=1h | /packs/{id}/history?field=..&range=1h | /packs/{id}/track?range=1h | /packs/{id}/faults?range=1h"})
 
 
 def lambda_handler(event, context):

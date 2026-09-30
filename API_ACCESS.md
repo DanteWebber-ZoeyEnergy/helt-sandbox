@@ -100,9 +100,16 @@ All are `GET`, all return JSON.
 | `/packs/{pack_id}/histories?range=1h` | all entitled fields' history in one call |
 | `/packs/{pack_id}/history?field=soc_pct&range=1h` | one field's history |
 | `/packs/{pack_id}/track?range=1h` | GPS trail (location entitlement only) |
+| `/packs/{pack_id}/faults?range=1h` | the pack's faults, newest first: `{faults:[{t, src, code}]}` (ops entitlement only) |
 
 `range` is one of `15m, 1h, 6h, 24h, 7d` (longer ranges are downsampled
-server-side to ~200–400 points). Timestamps are epoch seconds (UTC).
+server-side to ~200–400 points: a mean per window, except that surge and
+fault counts are summed, the surge peak is the window's maximum and the
+states are the value at the end of the window). Timestamps are epoch
+seconds (UTC). `/latest` also returns `telemetry_ts`, the time each field was
+last reported: not every field is in every sample (the 30 s summary fields,
+the GNSS and network positions), so compare it with `updated_ts` to tell a
+current value from an older one.
 
 ## What you can see
 
@@ -110,10 +117,15 @@ Access is per-pack and per-field-group. Groups:
 
 | Group | Fields |
 |---|---|
-| `core` | soc_pct, total_input_w, total_output_w, ac_output_w, dc_output_w, ac_input_w, solar_input_w |
+| `core` | soc_pct, total_input_w, total_output_w, ac_output_w, dc_output_w, ac_input_w, solar_input_w, batt_power_avg_w, ac_output_avg_w, dc_output_avg_w |
 | `health` | soh_pct, cycle_count, enclosure_temp_c, enclosure_humidity_pct |
-| `location` | lat, lon (and the `/track` endpoint) |
-| `ops` | si_state, bms_state, seq, ts_synced, pack_voltage_v, current_a, max_cell_temp_c, bms_protections |
+| `location` | lat, lon (GNSS), net_lat, net_lon, net_acc_m, net_src, net_age_s (network position from WiFi / cell tower, only while the GNSS has no fix; and the `/track` endpoint) |
+| `ops` | si_state, bms_state, seq, ts_synced, pack_voltage_v, current_a, max_cell_temp_c, bms_protections, power_w, inv_output_w, dc_input_w, interval_s, ac_surge_count, ac_surge_max_w, fault_count, inv_*_c (inverter temperatures), mppt_solar_temp_c, mppt_ac_temp_c (and the `/faults` endpoint) |
+
+The `*_avg_w` fields are means over each 30 s window (`interval_s`), in W;
+`batt_power_avg_w` is + while charging. `net_acc_m` is the network
+position's 68 % accuracy radius in m and `net_src` what it was worked out
+from (1 WiFi, 2 cell tower, 3 both).
 
 Your grant: `<GROUPS PER PACK>`. Fields outside your grant are simply absent
 from responses; endpoints outside it return `403 {"error":"forbidden"}`.

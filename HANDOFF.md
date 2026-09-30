@@ -94,6 +94,16 @@ Command ACKs are echoed onto `status` (non-retained). No separate ack topic.
 (This is what the *firmware* emits today. The sandbox payload has diverged —
 extra fields AND renamed power fields — see the schema-ahead note in §4.)
 
+**Firmware Phase L3 additions (2026-09-30, `CLOUD_SYNC_DESIGN.md` "Interval
+summary" + "Network position keys" is the authoritative schema):** every 30 s
+one sample also carries `interval_s`, `batt_power_avg_w` (signed, + charge),
+`ac_output_avg_w`, `dc_output_avg_w`, `ac_surge_count`, `ac_surge_max_w`,
+`fault_count` + a `faults` list of `{code, age_s}`, `soh_pct`, the inverter
+NTC temperatures `inv_*_c` and `mppt_solar_temp_c` / `mppt_ac_temp_c`; and a
+sample without a usable GNSS fix may carry the network position `net_lat`,
+`net_lon`, `net_acc_m`, `net_src`, `net_age_s` (behind the firmware switch
+`GEOLOC_LOOKUP_ENABLE`). All follow the absent-key rule.
+
 Other payloads: `v1.cells` (per-cell mV, off by default), status on connect
 (`online, pack_id, fw_version, uptime_s, si_state, ip`), command ACK
 (`{"ack":{"request_id","status","result"}}`), inbound command
@@ -172,7 +182,7 @@ in InfluxDB.
 ```
 helt-sandbox/
 ├── publisher/fake_pack.py       # fake SI: real schema-v1 over mTLS, instrumented
-├── lambdas/ingest/              # = production helt-iot-influx
+├── lambdas/ingest/              # byte-identical to the firmware repo's cloud/aws/lambda_function.py (L3)
 ├── lambdas/query/               # reads InfluxDB via Flux, serves the dashboard
 ├── aws/setup.sh                 # 6 numbered steps, creates everything
 ├── aws/teardown.sh              # deletes everything
@@ -196,7 +206,12 @@ are in `aws/config.env`, which is git-ignored):
 - IoT Rule `helt_to_influx` (every pack_id NOT prefixed `SANDBOX-`) →
   Lambda `helt-iot-influx` (role `helt-lambda-role`, log group at 7-day
   retention) → bucket `helt_prod`. The Lambda is the firmware repo's
-  `cloud/aws/lambda_function.py` unchanged (schema v1 fields).
+  `cloud/aws/lambda_function.py`; since firmware Phase L3 (2026-09-30) that
+  file and `lambdas/ingest` are ONE source deployed twice (`helt-iot-influx`,
+  `sandbox-ingest`), with the union of both field lists so every field keeps
+  the type it already has in each bucket, and faults written to their own
+  measurement `pack_fault` (tags `pack_id`, `src` bms/inv/dc, `code` "0x06";
+  field `n=1u`; one point per fault at the sample's ts minus `age_s`).
 - Things/certs are minted per pack at provisioning time (RUNBOOK §4). One so
   far: `HELT-0002` (2026-09-21), cert `9d3c67b8…303c`, bench pack.
 
@@ -215,10 +230,14 @@ is read from that bucket (`bucket_for()` in `lambdas/query/lambda_function.py`),
 single-bucket mode, byte-identical to the old behaviour. Access is unchanged:
 the DynamoDB entitlements decide who sees which pack regardless of bucket, so
 a real pack is visible to `helt-ops` (`*`) and to whoever is explicitly
-granted it, never to the sandbox demo customers. Caveat until the firmware
-payload catches up (§7): the v1 power fields (`power_w` / `inv_output_w` /
-`dc_input_w`) are not in any `FIELD_GROUPS` entry, so the API drops them and
-the dashboard's power charts + Net-power tile stay empty for real packs.
+granted it, never to the sandbox demo customers. Since firmware Phase L3
+(2026-09-30) the v1 power fields (`power_w` / `inv_output_w` / `dc_input_w`)
+are in `ops`, the 30 s means in `core`, surges / faults / component
+temperatures in `ops`, `net_*` in `location`; downsampling sums the counts,
+keeps the surge peak's max and the states' last value; `/latest` adds
+`telemetry_ts` (per-field last time); `GET /packs/{id}/faults` (ops) lists
+`pack_fault` points. The dashboard hides cards a pack has no data for, so a
+real pack and a sandbox fake each show their own fields.
 
 **Multi-pack fleet simulation** (since 2026-07-24): `fake_pack.py --packs N`
 (N ≤ 5) simulates a fleet from built-in per-pack profiles — distinct Western
@@ -326,8 +345,10 @@ Phase 7A):**
    if the batch has no anchor, and a 4xx from InfluxDB is logged and swallowed
    instead of raised (5xx still raises so real outages retry). Verified on the
    next boot: `seq 0-3` landed at `15:30:16-19Z` contiguous with `seq 4` at the
-   SNTP-sync second, one clean invocation. **Not ported to `lambdas/ingest`**
-   -- do it at the payload catch-up (§4/§7); `fake_pack.py` never sends `ts=0`.
+   SNTP-sync second, one clean invocation. **Ported to `lambdas/ingest`** in
+   firmware Phase L3 (2026-09-30: the two copies are now one file). Known gap:
+   the anchor assumes one seq step per second, which only holds at the WiFi
+   rate -- on cellular the firmware keeps one sample per 30 s (10 s moving).
 8. **Telemetry cadence is ~21 s, not 30 s.** The firmware's size trigger
    (`21 samples × 200 B estimate ≥ 4096`) fires before the 30 s timer at the
    1 Hz sampler; real batches are ~5.5 KB. Nothing to fix -- the dashboard's
@@ -474,6 +495,21 @@ findings in §5 (#7-#10); the Lambda one is fixed and redeployed, the display
 one is fixed in firmware. `TEST-0001` from 7A still shows in `/packs` (offline)
 until its rows age out of `helt_prod`.
 
+**Done (2026-09-30): firmware Phase L3 — telemetry payload catch-up +
+network location, cloud side.** Deployed, each with the user's go-ahead:
+the shared ingest source to `helt-iot-influx` and `sandbox-ingest` (both
+`update-function-code`, verified `Successful`; HELT-0002's batches kept
+landing in `helt_prod`), `sandbox-query` (field groups, downsampling per
+field, `telemetry_ts`, `/faults`), API route `GET /packs/{pack_id}/faults`
+(JWT, `helt-jwt`; `setup.sh` step 8 lists it), and this dashboard (30 s power
+means, surge dots, inverter + MPPT temperature charts with a value legend,
+faults list, state name in the header, the network position as a blue marker
++ accuracy circle apart from the red GNSS trail). Read-only checks before the
+deploy: live Lambdas and `helt-pack-policy` v1 matched the committed sources;
+no L3 field name existed in `helt_prod`. The `helt-pack-policy` Device
+Location grant (v2) and the bench proof are in the firmware repo's
+`LOCATION_DESIGN.md` §8 / L3 record.
+
 **Next for the real pack:** the firmware repo's open issue on the internal-RAM
 budget with Wi-Fi up (instrument the boot, trim the Wi-Fi buffer pools, LVGL
 allocation audit) is the one thing 7C surfaced that is not fixed -- it is a
@@ -489,10 +525,11 @@ cursor/mirroring endpoint, and a DynamoDB latest-state table were analysed
 (see chat history 2026-07-27ff) and deliberately deferred.
 
 **Payload dependency chain (for any future field change):** the serializer in
-`main/cloud_sync.c` (or `fake_pack.py` in sandbox) → the ingest Lambda's two
-type-bucket loops (`u` / float; the signed-`i` bucket died with `power_w`,
-2026-08-03) → `cloud/influxdb_schema.md` → the dashboard's `FIELDS` array →
-possibly the query Lambda. **And** any new or retyped field collides with the
+`main/cloud_sync.c` (or `fake_pack.py` in sandbox) → the ingest Lambda's three
+type lists (`UINT_FIELDS` / `FLOAT_FIELDS` / `INT_FIELDS`, one file for both
+deployments since L3) → `cloud/influxdb_schema.md` → the query Lambda's
+`FIELD_GROUPS` (and `AGG_FN` if a mean is wrong for it) → the dashboard's
+`FIELDS` / `MULTI` arrays. **And** any new or retyped field collides with the
 IOx locked schema in whichever bucket it lands.
 
 **Also outstanding:** InfluxDB retention policy on `helt_sandbox` (storage

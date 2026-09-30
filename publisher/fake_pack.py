@@ -69,9 +69,9 @@ def make_client(pack_id):
 # ---------------------------------------------------------------------------
 
 PHASE_STATES = {              # phase -> (si_state, bms_state)
-    "CHARGE":    (3, 2),      # placeholder enums; real values come from the
-    "DISCHARGE": (4, 3),      # BMS STATE_MACHINE_SPEC when the fw catches up
-    "REST":      (5, 4),
+    "CHARGE":    (4, 4),      # the real enums (CAN 0x100, firmware
+    "DISCHARGE": (4, 4),      # state_machine.h): 3 STANDBY, 4 ACTIVE --
+    "REST":      (3, 3),      # 5 is FAULT, which a resting pack is not
 }
 
 # Port ratings (W)
