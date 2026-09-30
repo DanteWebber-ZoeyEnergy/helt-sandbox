@@ -202,7 +202,9 @@ are in `aws/config.env`, which is git-ignored):
 
 **Production resources (stood up 2026-09-21, firmware repo
 `cloud/aws/RUNBOOK.md` is their runbook; same account/region):**
-- IoT Policy `helt-pack-policy` v1 (CN-scoped; `iot:RetainPublish` on `status`)
+- IoT Policy `helt-pack-policy` v2 (default since 2026-09-30; CN-scoped;
+  `iot:RetainPublish` on `status`; Device Location reserved topics). v1 (no
+  location) is kept as the previous version
 - IoT Rule `helt_to_influx` (every pack_id NOT prefixed `SANDBOX-`) →
   Lambda `helt-iot-influx` (role `helt-lambda-role`, log group at 7-day
   retention) → bucket `helt_prod`. The Lambda is the firmware repo's
@@ -506,9 +508,19 @@ means, surge dots, inverter + MPPT temperature charts with a value legend,
 faults list, state name in the header, the network position as a blue marker
 + accuracy circle apart from the red GNSS trail). Read-only checks before the
 deploy: live Lambdas and `helt-pack-policy` v1 matched the committed sources;
-no L3 field name existed in `helt_prod`. The `helt-pack-policy` Device
-Location grant (v2) and the bench proof are in the firmware repo's
-`LOCATION_DESIGN.md` §8 / L3 record.
+no L3 field name existed in `helt_prod`. A follow-up `sandbox-query` fix
+(`37190fa`, 14:57Z) reads each CSV table's own header (the histories union
+returns `last()` tables with their columns in another order) and lists each
+pack once in `/packs` (one row came back per `ts_synced` tag value).
+`helt-pack-policy` **v2** (default, 15:05:54Z; v1 kept) grants the AWS IoT
+Core Device Location reserved topics under each pack's own CN. Bench-proven
+on HELT-0002 the same afternoon: before the grant AWS dropped every connect
+0.4 s after the location SUBSCRIBE; after it, a WiFi lookup answered in
+497 ms (± 138 m, right on the map), and every L3 field landed in `helt_prod`
+with its designed type. Record: firmware `LOCATION_DESIGN.md` §10-§11.
+Open: the pack's motion detection reads "moving" on the bench (10 s
+publishing over cellular), and the pre-SNTP `seq` anchor is wrong on
+cellular (§5 #7).
 
 **Next for the real pack:** the firmware repo's open issue on the internal-RAM
 budget with Wi-Fi up (instrument the boot, trim the Wi-Fi buffer pools, LVGL
