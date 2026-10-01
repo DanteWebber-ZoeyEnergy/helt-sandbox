@@ -257,6 +257,13 @@ def influx_query(flux):
 # ---- raw data readers: everything below returns UNFILTERED data and is what
 # ---- the response cache stores; entitlement filtering happens in _handle().
 
+# A pack is online while its newest reading is under 6 min old. A still pack
+# on cellular uploads a batch every 5 min (firmware CLOUD_CELL_BATCH_PERIOD_S
+# = 300), so the old 90 s (3x the 30 s WiFi batch period) showed it offline
+# between batches. The dashboard's ONLINE_S matches.
+ONLINE_S = 6 * 60
+
+
 def all_packs():
     # Liveness = telemetry freshness, NOT status events. A stably-connected
     # pack can go days without a connect/disconnect event (the LWT still lands
@@ -279,7 +286,7 @@ def all_packs():
             if pid and in_bucket(bucket, pid):
                 last_seen = _iso_to_epoch(r.get("_time", ""))
                 packs.append({"pack_id": pid,
-                              "online": (now - last_seen) < 90,   # 3x fw batch period
+                              "online": (now - last_seen) < ONLINE_S,
                               "last_seen": last_seen})
     # One entry per pack: a pack's points are split into one table per
     # ts_synced tag value, so last() returns a row for each -- keep the newest.

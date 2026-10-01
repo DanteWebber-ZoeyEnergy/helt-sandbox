@@ -576,6 +576,11 @@ let view = "fleet";
 let PACKS = [];
 const packInfo = pid => PACKS.find(p => p.pack_id === pid) || null;
 const isOnline = p => !!p && (p.online === true || p.online === 1);
+// Online = uploaded within the last 6 min, the same cut-off as the API's
+// /packs `online` (query Lambda ONLINE_S): a still pack on cellular uploads a
+// batch every 5 min (firmware CLOUD_CELL_BATCH_PERIOD_S = 300), and the old
+// 90 s window showed it offline between batches.
+const ONLINE_S = 6 * 60;
 // An offline pack's latest values are older than the API's default 15 min
 // lookback, so ask for its last 30 days: one query either way, and an online
 // pack keeps the default, where a value it stopped sending drops out.
@@ -606,13 +611,13 @@ function netPower(t) {
 }
 const flowText = w => w == null ? "" : w > 30 ? "▲ charging" : w < -30 ? "▼ discharging" : "idle";
 
-// liveness = telemetry freshness (90 s ≈ 3x the firmware's 30 s batch period)
-// — the retained status flag can be days old on a stable connection. A 1 s
+// liveness = telemetry freshness (ONLINE_S) — the retained status flag can
+// be days old on a stable connection. A 1 s
 // local ticker keeps the age display and pill honest between 30 s polls.
 let lastUpdatedTs = null;
 function renderAge() {
   const age = lastUpdatedTs ? Math.max(0, Math.round(Date.now() / 1000 - lastUpdatedTs)) : null;
-  const online = age != null && age < 90;
+  const online = age != null && age < ONLINE_S;
   $("stateTxt").textContent = online ? "online" : "offline";
   $("packPill").classList.toggle("online", online);
   $("packPill").classList.toggle("offline", !online);
@@ -1251,7 +1256,7 @@ let faultsAllowed = true;                   // false after a 403: not entitled
 let latestT = {};
 let histLoaded = false;                     // a history answer for this pack is in
 function syncCards() {
-  const fresh = lastUpdatedTs != null && Date.now() / 1000 - lastUpdatedTs < 90;
+  const fresh = lastUpdatedTs != null && Date.now() / 1000 - lastUpdatedTs < ONLINE_S;
   for (const f of FIELDS) {
     cards[f.key].hidden = !(charts[f.key].data.length || (fresh && latestT[f.key] != null));
   }
@@ -2047,7 +2052,7 @@ function syncFleet() {
 function slotOnline(s) {
   const p = packInfo(s.pid);
   const last = Math.max(s.d?.updated_ts || 0, p?.last_seen || 0);
-  return { last, online: !!last && Date.now() / 1000 - last < 90 };
+  return { last, online: !!last && Date.now() / 1000 - last < ONLINE_S };
 }
 
 // header line + the "when" line: cheap, so the 1 s ticker keeps them live
