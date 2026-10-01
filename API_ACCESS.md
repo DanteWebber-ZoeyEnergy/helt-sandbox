@@ -96,7 +96,7 @@ All are `GET`, all return JSON.
 | Endpoint | Returns |
 |---|---|
 | `/packs` | your packs: `{packs:[{pack_id, online, last_seen}]}` |
-| `/packs/{pack_id}/latest` | newest value of each field you're entitled to |
+| `/packs/{pack_id}/latest` | newest value of each field you're entitled to, from the last 15 min; add `?lookback=24h`, `7d` or `30d` to reach further back (an offline pack's last reading) |
 | `/packs/{pack_id}/histories?range=1h` | all entitled fields' history in one call |
 | `/packs/{pack_id}/history?field=soc_pct&range=1h` | one field's history |
 | `/packs/{pack_id}/track?range=1h` | GPS trail (location entitlement only) |

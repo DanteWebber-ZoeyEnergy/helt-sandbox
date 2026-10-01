@@ -270,7 +270,9 @@ response is entitlement-filtered per user — see §7 and `API_ACCESS.md`):
   caller is entitled to)
 - `GET /packs/{pack_id}/latest` → `{pack_id, updated_ts, telemetry:{...}, status:{...}}`
   (`status` is `{}` unless `?status=1` — costs a second InfluxDB query and
-  liveness derives from telemetry freshness now)
+  liveness derives from telemetry freshness now; `?lookback=24h|7d|30d`
+  widens the default 15 min window, still one `last()` query — the dashboard
+  uses `30d` for an offline pack, to show its last reading and position)
 - `GET /packs/{pack_id}/histories?range=1h` → `{series:{field:[{t,v},...],…}}`
   — every field + GPS in ONE InfluxDB query; the dashboard's refresh path
 - `GET /packs/{pack_id}/history?field=soc_pct&range=1h` → `{series:[{t,v},...]}`
@@ -544,6 +546,28 @@ no ingest ERROR / WARN. Dashboard: the four cell cards (§3), previewed with
 sample data. Not yet seen with real data: HELT-0002 runs firmware without the
 block until it is flashed. `fake_pack.py` sends no cells, so the cards stay
 hidden for SANDBOX-* packs.
+
+**Built (2026-10-01): fleet view.** The dashboard opens on a fleet view: up
+to three packs side by side (each card picks its pack; picking one another
+card holds swaps them; the choice is kept in `localStorage` `helt_fleet`),
+each card the same layout on the same scales -- status + system state, SoC
+with a 24 h SoC trend (`history?field=soc_pct&range=24h`, fixed 0-100 % and
+now-24 h..now so the cards compare), battery power, then a row per fact the
+pack and the user have: output, input, battery V/A, max cell temp, cell
+balance, enclosure, health, faults in 24 h (`/faults`, ops), location -- and
+one map with every selected pack labelled by name. "Open pack" (or a map
+marker) goes to the existing single-pack view; the URL hash carries the view
+(`#fleet`, `#pack/HELT-0002`). Query budget: an online pack's `/latest`
+every 30 s, an offline pack's only when `/packs` shows a newer `last_seen`,
+trend + faults every 5 min, each view polling only while shown. An offline
+pack is read with `/latest?lookback=30d` (query Lambda change above, which
+also keeps the newest row per field when a field comes back once per
+`ts_synced` table); the pack view then widens its range to cover the last
+readings and hides cards whose only value is that old reading. Previewed
+against `helt_prod` (HELT-0001..0003) through the working-tree query Lambda
+run locally, as ops and as a core/health/location customer. Deploy order:
+`sandbox-query` first (an old Lambda ignores `lookback`, so offline cards
+just read "No recent readings"), then push `main` for Pages.
 
 **Next for the real pack:** the firmware repo's open issue on the internal-RAM
 budget with Wi-Fi up (instrument the boot, trim the Wi-Fi buffer pools, LVGL

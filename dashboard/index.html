@@ -44,8 +44,8 @@
   /* ---- header ---- */
   header {
     background: var(--surface); border-bottom: 1px solid var(--hairline);
-    padding: .8rem 1.5rem; display: flex; align-items: center; gap: 1rem;
-    position: sticky; top: 0; z-index: 1000;
+    padding: .8rem 1.5rem; display: flex; align-items: center; gap: .6rem 1rem;
+    flex-wrap: wrap; position: sticky; top: 0; z-index: 1000;
   }
   /* brand rules: logo in HELT Blue on light surfaces, min 95px wide digital */
   .logo { display: block; width: 126px; color: var(--ink); }
@@ -174,6 +174,65 @@
   .maplegend i.gnss { background: var(--red); }
   .maplegend i.net { background: var(--s1); box-shadow: 0 0 0 3px rgba(42,120,214,.18); }
 
+  /* ---- views: the fleet (up to three packs side by side) and one pack ---- */
+  body[data-view="fleet"] .packonly, body[data-view="pack"] .fleetonly { display: none; }
+  .viewseg button { font-size: 1.05rem; }
+
+  /* ---- fleet: one card per selected pack, same layout and scales in each
+     so the three read as small multiples ---- */
+  .fleet { display: grid; grid-template-columns: repeat(auto-fit, minmax(290px, 1fr));
+           gap: 1rem; }
+  .pcard { background: var(--surface); border: 1px solid var(--hairline);
+           border-radius: var(--radius); padding: .9rem 1rem 1rem;
+           display: flex; flex-direction: column; min-width: 0; }
+  .pcard[hidden] { display: none; }
+  .pcard .top { display: flex; align-items: center; gap: .6rem; }
+  .pcard .top .packsel { min-width: 0; max-width: 62%; }
+  .pcard .status { margin-left: auto; display: inline-flex; align-items: center; gap: .4rem;
+                   font-size: .82rem; color: var(--ink-2); white-space: nowrap; }
+  .pcard .status .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); }
+  .pcard .status.online .dot { background: var(--green); }
+  .pcard .status.offline .dot { background: var(--red); }
+  .pcard .when { font-size: .78rem; color: var(--muted); margin-top: .45rem; min-height: 1.2em;
+                 white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .pcard .socrow { display: flex; align-items: baseline; gap: .8rem; margin-top: .5rem; }
+  .pcard .soc { font-size: 2.6rem; font-weight: 700; line-height: 1; }
+  .pcard .soc .unit { font-size: 1rem; font-weight: 400; color: var(--ink-2); margin-left: .15rem; }
+  .pcard .flow { font-size: .9rem; color: var(--ink-2); }
+  .pcard .meter { margin-top: .55rem; }
+  .pcard .spark { position: relative; margin-top: .7rem; }
+  .pcard .spark svg { display: block; width: 100%; height: 48px; }
+  .pcard .spark .empty { position: absolute; inset: 14px 0 auto 0; text-align: center;
+                         color: var(--muted); font-size: .78rem; }
+  .pcard .spark .cap { display: flex; justify-content: space-between; font-size: .72rem;
+                       color: var(--muted); margin-top: .15rem; }
+  .pcard .nodata { color: var(--muted); font-size: .88rem; padding: 2.4rem 0; text-align: center; }
+  .pcard .nodata[hidden], .pcard .body[hidden] { display: none; }
+  .facts { display: grid; grid-template-columns: 6.4rem 1fr; gap: .4rem .7rem;
+           margin: .8rem 0 0; padding-top: .7rem; border-top: 1px solid var(--grid);
+           font-size: .86rem; }
+  .facts dt { color: var(--ink-2); font-size: .7rem; text-transform: uppercase;
+              letter-spacing: .07em; padding-top: .15rem; }
+  .facts dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+  .facts .sub { display: block; color: var(--muted); font-size: .78rem; }
+  .facts .flag { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+                 background: var(--red); margin-right: .35rem; vertical-align: 0; }
+  .linkish { background: none; border: 0; padding: 0; font: inherit; color: inherit;
+             cursor: pointer; text-align: left; text-decoration: underline dotted var(--muted);
+             text-underline-offset: 3px; }
+  .linkish:hover { color: var(--red-dk); }
+  .pcard .foot { margin-top: auto; padding-top: .9rem; }
+  .openbtn { width: 100%; border: 1px solid var(--hairline); border-radius: 8px;
+             background: none; color: var(--ink); cursor: pointer; font-size: 1.05rem;
+             padding: .4rem; }
+  .openbtn:hover { border-color: var(--red); color: var(--red-dk); }
+  .fleet-none { color: var(--muted); padding: 2rem 0; }
+  #histNone { font-size: .9rem; margin: .2rem 0 1rem; }
+  #fleetMap { height: 360px; }
+  .leaflet-tooltip.fleet-label { font: 500 .78rem Roboto, Arial, sans-serif; color: var(--ink);
+                                 border-color: var(--hairline); box-shadow: none;
+                                 padding: .1rem .4rem; }
+
   /* ---- login gate (spec S1 — a gate, not the future login UX) ---- */
   .login { position: fixed; inset: 0; z-index: 2000; background: var(--page);
            display: flex; align-items: center; justify-content: center; }
@@ -276,10 +335,13 @@
     </svg></div>
     <div class="subtitle">Pack telemetry</div>
   </div>
+  <nav class="seg viewseg" id="viewSeg" aria-label="View">
+    <button type="button" data-v="fleet">Fleet</button><button type="button" data-v="pack">Pack</button>
+  </nav>
   <div class="spacer"></div>
-  <select class="packsel" id="packSel" aria-label="Select pack"></select>
-  <span class="pill" id="packPill"><span class="dot"></span><span id="pid">—</span>&nbsp;<span id="stateTxt">connecting…</span><span id="sysState"></span></span>
-  <span class="updated" id="age">updated: never</span>
+  <select class="packsel packonly" id="packSel" aria-label="Select pack"></select>
+  <span class="pill packonly" id="packPill"><span class="dot"></span><span id="pid">—</span>&nbsp;<span id="stateTxt">connecting…</span><span id="sysState"></span></span>
+  <span class="updated packonly" id="age">updated: never</span>
   <span class="whoami" id="whoami"></span>
   <button class="signout" id="signout" hidden>Sign out</button>
 </header>
@@ -301,6 +363,26 @@
 </div>
 
 <main>
+  <section class="fleetonly" id="fleetView">
+    <div class="controls">
+      <h2>Fleet</h2>
+      <span class="updated">choose up to three packs · open one for all its data</span>
+    </div>
+    <section class="fleet" id="fleet"></section>
+    <div class="fleet-none" id="fleetNone" hidden>No packs on this account have reported in the last 30 days.</div>
+    <div class="map-card" id="fleetMapCard">
+      <div class="head">
+        <span class="label">Pack locations</span>
+        <span class="maplegend">
+          <span><i class="gnss"></i>GNSS fix</span>
+          <span><i class="net"></i>Network (WiFi / cell) ± accuracy</span>
+        </span>
+      </div>
+      <div id="fleetMap"></div>
+    </div>
+  </section>
+
+  <section class="packonly" id="packView">
   <section class="kpis">
     <div class="tile">
       <div class="label">State of charge</div>
@@ -331,8 +413,9 @@
   </div>
 
   <section class="charts" id="charts"></section>
+  <div class="updated" id="histNone" hidden></div>
 
-  <div class="map-card">
+  <div class="map-card" id="packMapCard">
     <div class="head">
       <span class="label">Location</span>
       <span class="maplegend">
@@ -345,11 +428,14 @@
   </div>
 
   <div class="err" id="err"></div>
+  </section>
 </main>
 
 <footer>
-  Sandbox dashboard — polls every 30 s (one bundled history query per refresh,
-  matching the pack's batch cadence). Geo-fencing controls land here next.
+  Sandbox dashboard — the pack view polls every 30 s (one bundled history query
+  per refresh, matching the pack's batch cadence); the fleet view re-reads an
+  online pack every 30 s, an offline one only when it reports again, and each
+  SoC trend and fault count every 5 min. Geo-fencing controls land here next.
 </footer>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
@@ -429,10 +515,47 @@ function startData() {
   $("login").hidden = true;
   $("signout").hidden = false;
   $("whoami").textContent = auth.email || "";
-  loadPacks().then(() => { pollLatest(); refreshHistory(); });
+  loadPacks().then(route);
 }
 // Selected pack — populated from GET /packs, remembered per browser
 let PACK = localStorage.getItem("helt_pack") || "SANDBOX-01";
+// Which view shows: "fleet" (up to three packs side by side) or "pack" (one
+// pack, all its data). The URL hash carries it (#fleet, #pack/HELT-0002), so
+// the back button and a shared link both work. Each view polls only while shown.
+let view = "fleet";
+// GET /packs: every pack this user may see, with online + last_seen
+let PACKS = [];
+const packInfo = pid => PACKS.find(p => p.pack_id === pid) || null;
+const isOnline = p => !!p && (p.online === true || p.online === 1);
+// An offline pack's latest values are older than the API's default 15 min
+// lookback, so ask for its last 30 days: one query either way, and an online
+// pack keeps the default, where a value it stopped sending drops out.
+const latestPath = pid => `/packs/${encodeURIComponent(pid)}/latest` +
+  (packInfo(pid) && !isOnline(packInfo(pid)) ? "?lookback=30d" : "");
+function agoText(sec) {
+  const s = Math.max(0, Math.round(sec));
+  if (s < 90) return `${s} s ago`;
+  if (s < 90 * 60) return `${Math.round(s / 60)} min ago`;
+  if (s < 48 * 3600) return `${Math.round(s / 3600)} h ago`;
+  return `${Math.round(s / 86400)} d ago`;
+}
+// a reading's time: "14:05" today, "Sep 30, 14:05" before
+function whenText(ts) {
+  const d = new Date(ts * 1000);
+  return d.toDateString() === new Date().toDateString()
+    ? d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+    : d.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+}
+// Battery power, + = charging. Ports in - ports out (sandbox fakes); a real
+// pack reports the battery's own power as a 30 s mean. Standby drain isn't
+// metered, so ~0 = idle.
+function netPower(t) {
+  const ports = !(t.total_input_w == null && t.total_output_w == null);
+  const w = ports ? (t.total_input_w ?? 0) - (t.total_output_w ?? 0)
+                  : (t.batt_power_avg_w ?? null);
+  return { w, avg: !ports && w != null };
+}
+const flowText = w => w == null ? "" : w > 30 ? "▲ charging" : w < -30 ? "▼ discharging" : "idle";
 
 // liveness = telemetry freshness (90 s ≈ 3x the firmware's 30 s batch period)
 // — the retained status flag can be days old on a stable connection. A 1 s
@@ -442,8 +565,9 @@ function renderAge() {
   const age = lastUpdatedTs ? Math.max(0, Math.round(Date.now() / 1000 - lastUpdatedTs)) : null;
   const online = age != null && age < 90;
   $("stateTxt").textContent = online ? "online" : "offline";
-  $("packPill").className = "pill " + (online ? "online" : "offline");
-  $("age").textContent = age != null ? `updated ${age} s ago` : "no data yet";
+  $("packPill").classList.toggle("online", online);
+  $("packPill").classList.toggle("offline", !online);
+  $("age").textContent = age != null ? `updated ${agoText(age)}` : "no data yet";
 }
 
 // Chart roster — extending the telemetry payload? See HANDOFF.md §7 for the
@@ -761,8 +885,9 @@ class MultiLineChart {
     new ResizeObserver(() => this.draw(this.data)).observe(this.svg);
   }
 
-  hasData() {
-    return this.series.some(s => (this.data[s.key] || []).length || this.now[s.key] != null);
+  hasData(useNow = true) {
+    return this.series.some(s => (this.data[s.key] || []).length ||
+                                 (useNow && this.now[s.key] != null));
   }
 
   // current values from /latest -> the legend's value column
@@ -1070,26 +1195,45 @@ let faultsAllowed = true;                   // false after a 403: not entitled
 
 // A card shows when the selected pack has that data -- in the history range
 // or in its latest values -- so a real pack and a sandbox fake each show
-// their own fields instead of a wall of empty charts.
+// their own fields instead of a wall of empty charts. An offline pack's latest
+// values are its last reading (the 30-day lookback), so for it only the range
+// counts; a range with nothing in it says so once instead.
 let latestT = {};
+let histLoaded = false;                     // a history answer for this pack is in
 function syncCards() {
+  const fresh = lastUpdatedTs != null && Date.now() / 1000 - lastUpdatedTs < 90;
   for (const f of FIELDS) {
-    cards[f.key].hidden = !(charts[f.key].data.length || latestT[f.key] != null);
+    cards[f.key].hidden = !(charts[f.key].data.length || (fresh && latestT[f.key] != null));
   }
-  for (const m of MULTI) cards[m.id].hidden = !multis[m.id].hasData();
+  for (const m of MULTI) cards[m.id].hidden = !multis[m.id].hasData(fresh);
   cards.cells_now.hidden = !cellStrip.hasData();
+  const any = Object.entries(cards).some(([id, c]) => id !== "faults" && !c.hidden);
+  $("histNone").hidden = any || !histLoaded;
+  $("histNone").textContent = `No readings in the last ${range}` +
+    (lastUpdatedTs ? ` — this pack last reported ${agoText(Date.now() / 1000 - lastUpdatedTs)}` : "") +
+    ". Pick a longer range above.";
 }
 
+function setRange(r) {
+  range = r;
+  for (const x of $("rangeSeg").children) x.classList.toggle("on", x.dataset.r === r);
+}
 for (const r of RANGES) {
   const b = document.createElement("button");
   b.textContent = r; b.dataset.r = r;
   if (r === range) b.classList.add("on");
-  b.addEventListener("click", () => {
-    range = r;
-    for (const x of $("rangeSeg").children) x.classList.toggle("on", x.dataset.r === r);
-    refreshHistory();
-  });
+  b.addEventListener("click", () => { setRange(r); refreshHistory(); });
   $("rangeSeg").appendChild(b);
+}
+// Opening an offline pack: widen the range (never narrow it) to the shortest
+// one reaching back twice as far as its last reading, so its last readings
+// fill the charts instead of an empty range.
+function fitRangeTo(pid) {
+  const p = packInfo(pid);
+  if (!p || isOnline(p) || !p.last_seen) return;
+  const need = 2 * (Date.now() / 1000 - p.last_seen);
+  if (RANGE_S[range] >= need) return;
+  setRange(RANGES.find(r => RANGE_S[r] >= need) || RANGES[RANGES.length - 1]);
 }
 
 /* --------------------------------- map ----------------------------------- */
@@ -1109,7 +1253,7 @@ const NET_STYLE = { color: "#2a78d6", weight: 1.5, opacity: .7, fillOpacity: .10
 const netTrail = L.layerGroup().addTo(map);
 const netNow = L.layerGroup().addTo(map);
 let mapFitted = false;
-const mapCard = document.querySelector(".map-card");
+const mapCard = $("packMapCard");
 function setMapVisible(v) {
   const was = mapCard.style.display !== "none";
   mapCard.style.display = v ? "" : "none";
@@ -1142,9 +1286,9 @@ async function pool(thunks, width) {
 }
 
 async function pollLatest() {
-  if (!auth) return;
+  if (!auth || view !== "pack") return;
   try {
-    const d = await getJSON(`/packs/${PACK}/latest`);
+    const d = await getJSON(latestPath(PACK));
     const t = withCells(d.telemetry || {});
     $("pid").textContent = d.pack_id || PACK;
     lastUpdatedTs = d.updated_ts || null;
@@ -1157,15 +1301,9 @@ async function pollLatest() {
 
     $("k_soc").textContent = fmt(t.soc_pct, 0);
     $("socMeter").style.width = `${Math.min(100, Math.max(0, t.soc_pct ?? 0))}%`;
-    // net = ports in - ports out (sandbox fakes); a real pack reports the
-    // battery's own power as a 30 s mean. Standby drain isn't metered, so ~0 = idle
-    const ports = !(t.total_input_w == null && t.total_output_w == null);
-    const netW = ports ? (t.total_input_w ?? 0) - (t.total_output_w ?? 0)
-               : (t.batt_power_avg_w ?? null);
+    const { w: netW, avg } = netPower(t);
     $("k_power").textContent = fmt(netW, 0);
-    $("k_powerNote").textContent = (netW == null ? "" :
-      netW > 30 ? "▲ charging" : netW < -30 ? "▼ discharging" : "idle") +
-      (!ports && netW != null ? " · 30 s avg" : "");
+    $("k_powerNote").textContent = flowText(netW) + (avg ? " · 30 s avg" : "");
     $("k_soh").textContent = fmt(t.soh_pct, 1);
     $("k_sohNote").textContent = t.max_cell_temp_c != null
       ? `max cell ${fmt(t.max_cell_temp_c, 1)} °C` : "";
@@ -1235,6 +1373,7 @@ function renderPosition(t, tts, updated) {
 let bundledApi = true;   // flips off if the deployed Lambda predates /histories
 
 function applyBundle(series) {
+  histLoaded = true;
   series = withCellSeries(series);
   cellStrip.setRecent(series);
   for (const f of FIELDS) {
@@ -1319,7 +1458,7 @@ async function loadFaults() {
 }
 
 async function refreshHistory() {
-  if (!auth) return;
+  if (!auth || view !== "pack") return;
   $("charts").classList.add("loading");
   const failed = [];
   loadFaults();                             // its own call, alongside the bundle
@@ -1366,8 +1505,11 @@ async function loadPacks() {
   try {
     const d = await getJSON("/packs");
     const packs = d.packs || [];
+    PACKS = packs;
+    syncFleet();
     if (!packs.length) return;
-    if (!packs.some(p => p.pack_id === PACK)) PACK = packs[0].pack_id;
+    // default the pack view's pack -- unless it shows one a link asked for
+    if (view !== "pack" && !packs.some(p => p.pack_id === PACK)) PACK = packs[0].pack_id;
     const sel = $("packSel");
     sel.replaceChildren(...packs.map(p => {
       const o = document.createElement("option");
@@ -1379,9 +1521,15 @@ async function loadPacks() {
   } catch (e) { console.warn("packs:", e); }
 }
 
-$("packSel").addEventListener("change", () => {
-  PACK = $("packSel").value;
+// the header picker re-points the pack view through the URL (back button works)
+$("packSel").addEventListener("change", () => openPack($("packSel").value));
+
+// Point the pack view at another pack: clear everything of the old one. The
+// view's own polls (pollLatest / refreshHistory) fetch the new pack.
+function selectPack(pid) {
+  PACK = pid;
   localStorage.setItem("helt_pack", PACK);
+  $("packSel").value = PACK;
   for (const f of FIELDS) charts[f.key].draw([]);   // new context — clear, don't blend
   for (const m of MULTI) { multis[m.id].setNow({}); multis[m.id].draw({}); }
   cellStrip.clear();
@@ -1396,9 +1544,486 @@ $("packSel").addEventListener("change", () => {
   netNow.clearLayers();
   mapFitted = false;                                // re-center on the new pack
   lastUpdatedTs = null;
-  pollLatest();
-  refreshHistory();
-});
+  histLoaded = false;
+  $("pid").textContent = PACK;
+  renderAge();
+}
+
+/* ------------------------------- fleet view --------------------------------
+   Up to three packs side by side, each card the same layout on the same
+   scales (SoC 0-100 %, the last 24 h) so the cards compare at a glance; one
+   map with every selected pack, labelled by name. Cost: an online pack's
+   /latest every 30 s (as the pack view), an offline pack's only when /packs
+   shows it reported again; the SoC trend + the fault list every 5 min. */
+const FLEET_SLOTS = 3;
+const FLEET_SLOW_MS = 5 * 60 * 1000;      // SoC trend + faults re-read period
+const SPARK_GAP_S = 20 * 60;              // a gap this long breaks the trend line
+const LABEL_DIR = ["top", "right", "bottom"];   // map labels: one side per slot,
+const LABEL_OFF = [[0, -9], [9, 0], [0, 9]];    // so packs parked together stay legible
+
+/* SoC over the last 24 h: one series in the brand red on a fixed 0-100 %
+   scale and a fixed now-24 h..now axis, so every card's trend lines up. */
+class SparkLine {
+  constructor(box) {
+    this.svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    box.appendChild(this.svg);
+    this.tip = document.createElement("div");
+    this.tip.className = "tooltip";
+    box.appendChild(this.tip);
+    this.empty = document.createElement("div");
+    this.empty.className = "empty";
+    this.empty.textContent = "no SoC readings in the last 24 h";
+    box.appendChild(this.empty);
+    const cap = document.createElement("div");
+    cap.className = "cap";
+    const a = document.createElement("span"), b = document.createElement("span");
+    a.textContent = "SoC · last 24 h"; b.textContent = "now";
+    cap.append(a, b);
+    box.appendChild(cap);
+    this.pts = null;
+    this.svg.addEventListener("pointermove", e => this.hover(e));
+    this.svg.addEventListener("pointerleave", () => this.hover(null));
+    new ResizeObserver(() => this.draw()).observe(this.svg);
+  }
+
+  set(pts) { this.pts = pts; this.draw(); }
+
+  draw() {
+    const W = this.svg.clientWidth || 300, H = 48;
+    const M = { l: 2, r: 6, t: 5, b: 5 };
+    this.svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+    this.svg.replaceChildren();
+    this.geom = null;
+    const x1 = Date.now() / 1000, x0 = x1 - 86400;
+    const pts = (this.pts || []).filter(p => p.t >= x0 && p.v != null);
+    this.empty.style.display = this.pts && !pts.length ? "" : "none";
+    const X = t => M.l + (t - x0) / (x1 - x0) * (W - M.l - M.r);
+    const Y = v => H - M.b - Math.max(0, Math.min(100, v)) / 100 * (H - M.t - M.b);
+    const NS = this.svg.namespaceURI;
+    const el = (n, at) => { const e = document.createElementNS(NS, n);
+      for (const k in at) e.setAttribute(k, at[k]); this.svg.appendChild(e); return e; };
+    for (const v of [0, 50, 100]) {
+      el("line", { x1: M.l, x2: W - M.r, y1: Y(v), y2: Y(v),
+                   stroke: v ? "var(--grid)" : "var(--hairline)", "stroke-width": 1 });
+    }
+    if (!pts.length) return;
+    // one path per run of readings; an outage leaves a gap, not a ramp
+    const runs = [[pts[0]]];
+    for (let i = 1; i < pts.length; i++) {
+      if (pts[i].t - pts[i - 1].t > SPARK_GAP_S) runs.push([]);
+      runs[runs.length - 1].push(pts[i]);
+    }
+    for (const run of runs) {
+      if (run.length < 2) {
+        el("circle", { cx: X(run[0].t), cy: Y(run[0].v), r: 2, fill: "var(--red)" });
+        continue;
+      }
+      const xy = run.map(p => `${X(p.t).toFixed(1)},${Y(p.v).toFixed(1)}`);
+      el("path", { d: `M${xy.join("L")}L${X(run.at(-1).t).toFixed(1)},${Y(0)}` +
+                      `L${X(run[0].t).toFixed(1)},${Y(0)}Z`,
+                   fill: "var(--red-wash)", stroke: "none" });
+      el("path", { d: `M${xy.join("L")}`, fill: "none", stroke: "var(--red)",
+                   "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" });
+    }
+    const last = pts.at(-1);
+    el("circle", { cx: X(last.t), cy: Y(last.v), r: 4, fill: "var(--red)",
+                   stroke: "var(--surface)", "stroke-width": 2 });
+    this.cross = el("line", { x1: 0, x2: 0, y1: M.t, y2: H - M.b,
+                              stroke: "var(--hairline)", "stroke-width": 1, opacity: 0 });
+    this.dot = el("circle", { r: 4, fill: "var(--red)", stroke: "var(--surface)",
+                              "stroke-width": 2, opacity: 0 });
+    this.geom = { X, Y, pts };
+  }
+
+  hover(e) {
+    if (!e || !this.geom) {
+      if (this.cross) { this.cross.setAttribute("opacity", 0); this.dot.setAttribute("opacity", 0); }
+      this.tip.style.opacity = 0;
+      return;
+    }
+    const { X, Y, pts } = this.geom;
+    const mx = e.clientX - this.svg.getBoundingClientRect().left;
+    let best = pts[0], bd = Infinity;
+    for (const p of pts) {
+      const d = Math.abs(X(p.t) - mx);
+      if (d < bd) { bd = d; best = p; }
+    }
+    const px = X(best.t), py = Y(best.v);
+    this.cross.setAttribute("x1", px); this.cross.setAttribute("x2", px);
+    this.cross.setAttribute("opacity", 1);
+    this.dot.setAttribute("cx", px); this.dot.setAttribute("cy", py);
+    this.dot.setAttribute("opacity", 1);
+    this.tip.replaceChildren();
+    const b = document.createElement("b");
+    b.textContent = `${fmt(best.v, 0)} %`;
+    const tm = document.createElement("span");
+    tm.className = "tt-time";
+    tm.textContent = " " + whenText(best.t);
+    this.tip.append(b, tm);
+    this.tip.style.left = `${Math.max(40, Math.min(px, this.svg.clientWidth - 40))}px`;
+    this.tip.style.top = "0px";
+    this.tip.style.opacity = 1;
+  }
+}
+
+// Where the pack is (or was at its last reading): the GNSS fix or the network
+// position that came with the newest sample, else the more recent of the two.
+function packPosition(t, tts, updated) {
+  const cur = k => !updated || (tts[k] != null && tts[k] >= updated - 2);
+  const g = t.lat != null && t.lon != null
+    ? { kind: "gnss", lat: t.lat, lon: t.lon, t: tts.lat, current: cur("lat") } : null;
+  const n = t.net_lat != null && t.net_lon != null
+    ? { kind: "net", lat: t.net_lat, lon: t.net_lon, acc: Number(t.net_acc_m ?? 0),
+        src: t.net_src, t: tts.net_lat, current: cur("net_lat") } : null;
+  if (g && g.current) return g;
+  if (n && n.current) return n;
+  if (g && n) return (g.t ?? 0) >= (n.t ?? 0) ? g : n;
+  return g || n;
+}
+
+/* --- fleet map: every selected pack, labelled; click a pack to open it --- */
+const fleetMap = L.map("fleetMap", { zoomControl: true, attributionControl: true });
+L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+  { maxZoom: 19, attribution: "&copy; OpenStreetMap contributors" }).addTo(fleetMap);
+fleetMap.setView([-33.9249, 18.4241], 11);
+const fleetLayer = L.layerGroup().addTo(fleetMap);
+let fleetFitKey = "";
+function setFleetMapVisible(v) {
+  const card = $("fleetMapCard"), was = card.style.display !== "none";
+  card.style.display = v ? "" : "none";
+  if (v && !was) setTimeout(() => fleetMap.invalidateSize(), 0);
+}
+
+/* --- slots: one card each, the pack in it chosen on the card itself --- */
+const slots = [];
+let fleetIds = (() => {
+  try { const a = JSON.parse(localStorage.getItem("helt_fleet")); return Array.isArray(a) ? a : null; }
+  catch { return null; }
+})();
+function saveFleet() {
+  fleetIds = slots.map(s => s.pid);
+  try { localStorage.setItem("helt_fleet", JSON.stringify(fleetIds)); } catch {}
+}
+
+function makeSlot(i) {
+  const s = { i, pid: "", d: null, err: "", seen: undefined, pos: null, marker: null,
+              sparkAt: 0, faults: null, faultsAt: 0, faultsOk: true, el: {} };
+  const e = s.el, mk = (tag, cls, parent) => {
+    const x = document.createElement(tag);
+    if (cls) x.className = cls;
+    if (parent) parent.appendChild(x);
+    return x;
+  };
+  e.card = mk("article", "pcard", $("fleet"));
+  const top = mk("div", "top", e.card);
+  e.sel = mk("select", "packsel", top);
+  e.sel.setAttribute("aria-label", `Pack in card ${i + 1}`);
+  e.sel.addEventListener("change", () => {
+    const v = e.sel.value, old = s.pid;
+    // a pack shows once: picking one another card holds swaps the two
+    const other = v && slots.find(o => o !== s && o.pid === v);
+    if (other) setSlotPack(other, old);
+    setSlotPack(s, v);
+    saveFleet();
+    renderFleetMap();
+    refreshFleet();
+  });
+  e.status = mk("span", "status", top);
+  mk("span", "dot", e.status);
+  e.statusTxt = mk("span", "", e.status);
+  e.when = mk("div", "when", e.card);
+  e.nodata = mk("div", "nodata", e.card);
+  e.body = mk("div", "body", e.card);
+  const socrow = mk("div", "socrow", e.body);
+  const soc = mk("div", "soc", socrow);
+  e.soc = mk("span", "", soc);
+  mk("span", "unit", soc).textContent = "%";
+  e.flow = mk("div", "flow", socrow);
+  e.meter = mk("i", "", mk("div", "meter", e.body));
+  s.spark = new SparkLine(mk("div", "spark", e.body));
+  e.facts = mk("dl", "facts", e.body);
+  const foot = mk("div", "foot", e.card);
+  e.open = mk("button", "btnish openbtn", foot);
+  e.open.type = "button";
+  e.open.textContent = "Open pack →";
+  e.open.addEventListener("click", () => s.pid && openPack(s.pid));
+  return s;
+}
+for (let i = 0; i < FLEET_SLOTS; i++) slots.push(makeSlot(i));
+
+function setSlotPack(s, pid) {
+  if (s.pid === pid) return;
+  Object.assign(s, { pid, d: null, err: "", seen: undefined, pos: null, marker: null,
+                     sparkAt: 0, faults: null, faultsAt: 0, faultsOk: true });
+  s.el.sel.value = pid;
+  s.spark.set(null);
+  renderSlot(s);
+}
+
+// After every GET /packs: the card pickers' options, and which pack each card
+// holds (a remembered choice survives; a pack no longer listed is replaced).
+let fleetOptsKey = "";
+function syncFleet() {
+  const n = Math.min(FLEET_SLOTS, PACKS.length);
+  $("fleetNone").hidden = PACKS.length > 0;
+  const key = PACKS.map(p => p.pack_id).join(",");
+  if (key !== fleetOptsKey) {            // rebuilding an open <select> closes it
+    fleetOptsKey = key;
+    for (const s of slots) {
+      const none = document.createElement("option");
+      none.value = ""; none.textContent = "— none —";
+      s.el.sel.replaceChildren(none, ...PACKS.map(p => {
+        const o = document.createElement("option");
+        o.value = p.pack_id;
+        o.textContent = p.pack_id;          // the card's status says online / offline
+        return o;
+      }));
+      s.el.sel.value = s.pid;
+    }
+  }
+  // the most recently seen packs fill any card with no valid choice
+  const known = new Set(PACKS.map(p => p.pack_id));
+  const want = (fleetIds || []).slice(0, n).map(id => id === "" || known.has(id) ? id : null);
+  while (want.length < n) want.push(null);
+  const spare = [...PACKS].sort((a, b) => (b.last_seen || 0) - (a.last_seen || 0))
+    .map(p => p.pack_id).filter(id => !want.includes(id));
+  slots.forEach((s, i) => {
+    s.el.card.hidden = i >= n;
+    setSlotPack(s, i >= n ? "" : want[i] ?? spare.shift() ?? "");
+  });
+  if (n) saveFleet();
+  if (view === "fleet") renderFleetMap();
+}
+
+function slotOnline(s) {
+  const p = packInfo(s.pid);
+  const last = Math.max(s.d?.updated_ts || 0, p?.last_seen || 0);
+  return { last, online: !!last && Date.now() / 1000 - last < 90 };
+}
+
+// header line + the "when" line: cheap, so the 1 s ticker keeps them live
+function renderSlotStatus(s) {
+  const e = s.el;
+  if (!s.pid) { e.status.className = "status"; e.statusTxt.textContent = ""; e.when.textContent = ""; return; }
+  const { last, online } = slotOnline(s);
+  e.status.className = "status " + (online ? "online" : "offline");
+  e.statusTxt.textContent = online ? "Online" : "Offline";
+  const t = s.d?.telemetry || {};
+  const state = t.bms_state != null && STATE_NAMES[t.bms_state] ? STATE_NAMES[t.bms_state] + " · " : "";
+  // one line in every card, so the three stay aligned; the clock time hovers
+  const ago = agoText(Date.now() / 1000 - last);
+  e.when.textContent = !last ? "" : `${state}${online ? "updated" : "last reading"} ${ago}`;
+  e.when.title = last ? `Last reading ${whenText(last)}` : "";
+}
+
+function renderSlot(s) {
+  const e = s.el;
+  renderSlotStatus(s);
+  e.open.disabled = !s.pid;
+  const t = withCells(s.d?.telemetry || {});
+  const tts = s.d?.telemetry_ts || {};
+  const upd = s.d?.updated_ts || 0;
+  const has = !!upd && Object.keys(t).length > 0;
+  e.body.hidden = !has;
+  e.nodata.hidden = has;
+  s.pos = has ? packPosition(t, tts, upd) : null;
+  if (!has) {
+    e.nodata.textContent = !s.pid ? "Pick a pack for this card."
+      : s.err ? `⚠ ${s.err}` : !s.d ? "Loading…" : "No recent readings.";
+    return;
+  }
+  e.soc.textContent = fmt(t.soc_pct, 0);
+  e.meter.style.width = `${Math.min(100, Math.max(0, t.soc_pct ?? 0))}%`;
+  const { w } = netPower(t);
+  e.flow.textContent = w == null ? "" : flowText(w) + (Math.abs(w) > 30 ? ` · ${fmt(Math.abs(w), 0)} W` : "");
+
+  // compact facts: a row only where the pack (and this user) has the data
+  const rows = [];
+  const W = v => `${fmt(v, 0)} W`;
+  const parts = list => list.filter(([v]) => v != null).map(([v, txt]) => txt(v)).join(" · ");
+  const add = (label, main, sub, onClick) => { if (main) rows.push({ label, main, sub, onClick }); };
+  add("Output", parts([[t.ac_output_avg_w ?? t.ac_output_w, v => `AC ${W(v)}`],
+                       [t.dc_output_avg_w ?? t.dc_output_w, v => `DC ${W(v)}`]]));
+  add("Input", parts([[t.ac_input_w, v => `AC ${W(v)}`], [t.solar_input_w, v => `Solar ${W(v)}`],
+                      [t.dc_input_w, v => `DC ${W(v)}`]]));
+  add("Battery", parts([[t.pack_voltage_v, v => `${fmt(v, 2)} V`], [t.current_a, v => `${fmt(v, 1)} A`]]));
+  add("Cell temp", t.max_cell_temp_c != null ? `${fmt(t.max_cell_temp_c, 1)} °C max` : "");
+  add("Cell balance", t.cell_spread_mv != null ? `${fmt(t.cell_spread_mv, 0)} mV spread` : "",
+      t.cell_spread_mv != null ? `lowest cell ${t.cell_min_idx}, highest cell ${t.cell_max_idx}` : "");
+  add("Enclosure", parts([[t.enclosure_temp_c, v => `${fmt(v, 1)} °C`],
+                          [t.enclosure_humidity_pct, v => `${fmt(v, 0)} %RH`]]));
+  add("Health", parts([[t.soh_pct, v => `SoH ${fmt(v, 0)} %`], [t.cycle_count, v => `${v} cycles`]]));
+  if (s.faultsOk && s.faults) {
+    const n = s.faults.length, f = s.faults[0];
+    add("Faults 24 h", n ? `${n}${n >= FAULTS_SHOWN ? "+" : ""}` : "none",
+        n ? `latest ${FAULT_NAMES[parseInt(f.code, 16)] || "unknown fault"} (${f.code}), ${whenText(f.t)}` : "");
+    if (n) rows.at(-1).flag = true;
+  }
+  const p = s.pos;
+  if (p) {
+    const what = p.kind === "gnss" ? "GNSS fix"
+      : `Network ± ${fmt(p.acc, 0)} m (${NET_SRC[p.src] || "?"})`;
+    add("Location", what,
+        `${Number(p.lat).toFixed(5)}, ${Number(p.lon).toFixed(5)}` +
+        (p.current || !p.t ? "" : ` · as of ${whenText(p.t)}`),
+        () => focusPack(s));
+  }
+  e.facts.replaceChildren(...rows.flatMap(r => {
+    const dt = document.createElement("dt");
+    dt.textContent = r.label;
+    const dd = document.createElement("dd");
+    const main = document.createElement(r.onClick ? "button" : "span");
+    if (r.onClick) {
+      main.type = "button"; main.className = "linkish";
+      main.title = "Show on the map";
+      main.addEventListener("click", r.onClick);
+    }
+    if (r.flag) { const i = document.createElement("i"); i.className = "flag"; dd.appendChild(i); }
+    main.append(r.main);
+    dd.appendChild(main);
+    if (r.sub) {
+      const sub = document.createElement("span");
+      sub.className = "sub"; sub.textContent = r.sub;
+      dd.appendChild(sub);
+    }
+    return [dt, dd];
+  }));
+}
+const FAULTS_SHOWN = 200;                  // the API's cap on /faults rows
+
+function renderFleetMap() {
+  fleetLayer.clearLayers();
+  const pts = [];
+  for (const s of slots) {
+    s.marker = null;
+    const p = s.pid && s.pos;
+    if (!p) continue;
+    const { online } = slotOnline(s);
+    if (p.kind === "net") {
+      L.circle([p.lat, p.lon], { ...NET_STYLE, radius: p.acc,
+                                 opacity: online ? .7 : .4 }).addTo(fleetLayer);
+    }
+    s.marker = L.marker([p.lat, p.lon], {
+      icon: L.divIcon({ className: "", iconSize: [14, 14], iconAnchor: [7, 7],
+                        html: `<div class="${p.kind === "gnss" ? "pack-marker" : "net-marker"}"></div>` }),
+      opacity: online ? 1 : .6, title: `Open ${s.pid}`,
+    }).bindTooltip(s.pid + (online ? "" : " (offline)"),
+                   { permanent: true, direction: LABEL_DIR[s.i], offset: LABEL_OFF[s.i],
+                     className: "fleet-label" })
+      .on("click", () => openPack(s.pid))
+      .addTo(fleetLayer);
+    pts.push([p.lat, p.lon]);
+  }
+  setFleetMapVisible(pts.length > 0);
+  // fit once per set of packs shown -- never fight the user's own pan/zoom
+  const key = slots.map(s => s.pid + (s.pos ? "@" : "")).join("|");
+  if (pts.length && key !== fleetFitKey) {
+    fleetFitKey = key;
+    setTimeout(() => {
+      fleetMap.invalidateSize();
+      if (pts.length === 1) fleetMap.setView(pts[0], 15);
+      else fleetMap.fitBounds(L.latLngBounds(pts), { maxZoom: 17, padding: [50, 50] });
+    }, 0);
+  }
+}
+
+function focusPack(s) {
+  if (!s.pos) return;
+  fleetMap.setView([s.pos.lat, s.pos.lon], Math.max(fleetMap.getZoom(), 16));
+  $("fleetMapCard").scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+let fleetBusy = false, fleetAgain = false;
+async function refreshFleet() {
+  if (!auth || view !== "fleet") return;
+  if (fleetBusy) { fleetAgain = true; return; }
+  fleetBusy = true;
+  try {
+    const now = Date.now(), jobs = [];
+    for (const s of slots) {
+      const pid = s.pid;
+      if (!pid) continue;
+      const enc = encodeURIComponent(pid), p = packInfo(pid);
+      // latest: always for an online pack; an offline one only once, and
+      // again when /packs shows it has reported since
+      if (!s.d || isOnline(p) || (p && p.last_seen !== s.seen)) {
+        const seen = p ? p.last_seen : undefined;
+        jobs.push(() => getJSON(latestPath(pid)).then(d => {
+          if (s.pid !== pid) return;        // the card was re-pointed meanwhile
+          Object.assign(s, { d, seen, err: "" });
+        }).catch(e => { if (s.pid === pid) s.err = e.message; }));
+      }
+      if (now - s.sparkAt > FLEET_SLOW_MS) {
+        jobs.push(() => getJSON(`/packs/${enc}/history?field=soc_pct&range=24h`).then(h => {
+          if (s.pid !== pid) return;
+          s.sparkAt = Date.now();
+          s.spark.set(h.series || []);
+        }).catch(e => {
+          console.warn(`soc trend ${pid}:`, e);
+          if (s.pid === pid && String(e.message).startsWith("403")) {
+            s.sparkAt = Date.now(); s.spark.set([]);
+          }
+        }));
+      }
+      if (s.faultsOk && now - s.faultsAt > FLEET_SLOW_MS) {
+        jobs.push(() => getJSON(`/packs/${enc}/faults?range=24h`).then(d => {
+          if (s.pid !== pid) return;
+          s.faultsAt = Date.now();
+          s.faults = d.faults || [];
+        }).catch(e => {
+          if (s.pid !== pid) return;
+          // not entitled ('ops' only), or a Lambda without /faults: no row
+          if (/^403|API 404/.test(String(e.message))) s.faultsOk = false;
+          else console.warn(`faults ${pid}:`, e);
+        }));
+      }
+    }
+    await pool(jobs, 3);
+    for (const s of slots) renderSlot(s);
+    renderFleetMap();
+  } finally {
+    fleetBusy = false;
+    if (fleetAgain) { fleetAgain = false; refreshFleet(); }
+  }
+}
+
+/* -------------------------------- routing -------------------------------- */
+function openPack(pid) { location.hash = `#pack/${encodeURIComponent(pid)}`; }
+
+function showView(v, fetch = true) {
+  if (v !== view) window.scrollTo(0, 0);
+  view = v;
+  document.body.dataset.view = v;
+  for (const b of $("viewSeg").children) b.classList.toggle("on", b.dataset.v === v);
+  if (!fetch) return;
+  if (v === "pack") {
+    setTimeout(() => map.invalidateSize(), 0);   // Leaflet re-measures once shown
+    pollLatest();
+    refreshHistory();
+  } else {
+    fleetFitKey = "";                            // re-fit to the packs on return
+    for (const s of slots) renderSlot(s);
+    renderFleetMap();
+    refreshFleet();
+  }
+}
+let routed = false;                          // the first route() of a page load
+function route() {
+  const m = location.hash.match(/^#pack\/(.+)$/);
+  if (!m) return showView("fleet");
+  const pid = decodeURIComponent(m[1]);
+  const entering = !routed || view !== "pack" || pid !== PACK;
+  routed = true;
+  if (pid !== PACK) selectPack(pid);
+  if (entering) fitRangeTo(pid);
+  showView("pack");
+}
+window.addEventListener("hashchange", route);
+for (const b of $("viewSeg").children) {
+  b.addEventListener("click", () => {
+    location.hash = b.dataset.v === "pack" ? `#pack/${encodeURIComponent(PACK)}` : "#fleet";
+  });
+}
 
 $("loginForm").addEventListener("submit", async e => {
   e.preventDefault();
@@ -1416,15 +2041,21 @@ $("loginForm").addEventListener("submit", async e => {
 });
 $("signout").addEventListener("click", () => signOut(false));
 
+// the view from the URL; its data follows sign-in and the pack list (startData)
+showView(/^#pack\//.test(location.hash) ? "pack" : "fleet", false);
 if (auth) startData(); else showLogin();
 // 30 s poll matches the pack's batch cadence and the server-side response
 // cache — faster polling only re-reads the same cached answer (see
-// API_SECURITY_SPEC.md §5); the 1 s ticker keeps the age display live.
-// All pollers no-op while signed out.
+// API_SECURITY_SPEC.md §5); the 1 s ticker keeps the age displays live.
+// All pollers no-op while signed out, and each view's only while it shows.
 setInterval(pollLatest, 30000);
 setInterval(refreshHistory, 30000);
+setInterval(refreshFleet, 30000);
 setInterval(loadPacks, 60000);
-setInterval(renderAge, 1000);
+setInterval(() => {
+  renderAge();
+  if (view === "fleet") for (const s of slots) renderSlotStatus(s);
+}, 1000);
 </script>
 </body>
 </html>

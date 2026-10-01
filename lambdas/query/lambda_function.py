@@ -12,8 +12,9 @@ caller is before this code runs; this Lambda decides WHAT they may see
 Routes (all require `Authorization: Bearer <access token>`):
     GET /packs
         -> entitled packs only, joined with live online status
-    GET /packs/{pack_id}/latest
+    GET /packs/{pack_id}/latest[?lookback=30d]
         -> latest value of every ENTITLED field (+ status if 'ops' & ?status=1)
+           within the lookback (default 15m; 30d = an offline pack's last data)
     GET /packs/{pack_id}/histories?range=1h
         -> { series: { field: [{t,v},...] } } entitled fields, ONE Influx query
     GET /packs/{pack_id}/history?field=soc_pct&range=1h
@@ -73,6 +74,12 @@ RANGES = {
     "24h": ("-24h", "5m"),
     "7d":  ("-7d",  "30m"),
 }
+
+# /latest lookback -> Flux start. The default 15m keeps a value the pack has
+# stopped sending from reading as current; the dashboard asks for 30d for a
+# pack that is offline, to show its last reading and where it was last seen.
+# One last() query either way (InfluxDB bills per query, not per row read).
+LOOKBACKS = {"15m": "-15m", "24h": "-24h", "7d": "-7d", "30d": "-30d"}
 
 # Entitlements name GROUPS, not fields (spec §3): adding a telemetry field
 # later means touching this map only, never the DynamoDB rows. This map is
@@ -275,11 +282,11 @@ def all_packs():
     return packs
 
 
-def latest_data(pack_id, include_status):
+def latest_data(pack_id, include_status, lookback="15m"):
     bucket = bucket_for(pack_id)
     flux = (
         f'from(bucket:"{bucket}")'
-        f'|> range(start:-15m)'
+        f'|> range(start:{LOOKBACKS[lookback]})'
         f'|> filter(fn:(r)=> r._measurement=="telemetry" and r.pack_id=="{pack_id}")'
         f'|> last()'
     )
@@ -288,13 +295,15 @@ def latest_data(pack_id, include_status):
     # and network positions come and go), so "latest" alone cannot say
     # whether a value is current -- the dashboard compares these with
     # updated_ts, e.g. to tell which position is where the pack is now.
+    # A field can come back once per ts_synced tag value (one table each), so
+    # the newest row wins -- over a long lookback both tables are common.
     telemetry = {}
     telemetry_ts = {}
     newest = 0
     for r in influx_query(flux):
         f, v = r.get("_field"), r.get("_value")
         t = _iso_to_epoch(r.get("_time", ""))
-        if f and v not in (None, ""):
+        if f and v not in (None, "") and t >= telemetry_ts.get(f, 0):
             telemetry[f] = _num(v)
             telemetry_ts[f] = t
         newest = max(newest, t)
@@ -474,8 +483,11 @@ def _handle(event, audit):
         if kind == "latest":
             # status is ops-only; key the cache on what we READ, not the user
             inc = q.get("status") == "1" and "ops" in groups
-            data = cached(("latest", pack_id, inc),
-                          lambda: latest_data(pack_id, inc))
+            lb = q.get("lookback", "15m")
+            if lb not in LOOKBACKS:
+                lb = "15m"
+            data = cached(("latest", pack_id, inc, lb),
+                          lambda: latest_data(pack_id, inc, lb))
             audit["decision"] = "allow"
             return reply(200, {
                 "pack_id": pack_id, "updated_ts": data["updated_ts"],
@@ -525,7 +537,7 @@ def _handle(event, audit):
 
     audit["route"] = "unknown"
     return reply(404, {"error": "not found",
-                       "hint": "GET /packs | /packs/{id}/latest | /packs/{id}/histories?range=1h | /packs/{id}/history?field=..&range=1h | /packs/{id}/track?range=1h | /packs/{id}/faults?range=1h"})
+                       "hint": "GET /packs | /packs/{id}/latest[?lookback=30d] | /packs/{id}/histories?range=1h | /packs/{id}/history?field=..&range=1h | /packs/{id}/track?range=1h | /packs/{id}/faults?range=1h"})
 
 
 def lambda_handler(event, context):
