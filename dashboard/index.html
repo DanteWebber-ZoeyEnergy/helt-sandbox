@@ -69,7 +69,9 @@
   .pill.offline .dot { background: var(--red); }
   .updated { font-size: .8rem; color: var(--muted); }
 
-  main { max-width: 1180px; margin: 0 auto; padding: 1.5rem; }
+  /* both views use a big screen's width (to a cap): more chart columns in the
+     pack view, wider cards and map in the fleet view */
+  main { max-width: 2400px; margin: 0 auto; padding: 1.5rem; }
 
   /* ---- KPI tiles ---- */
   .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
@@ -161,7 +163,7 @@
                            letter-spacing: .08em; color: var(--ink-2); flex: 1; }
   .map-card .head .coords { font-size: .85rem; color: var(--ink-2);
                             font-variant-numeric: tabular-nums; }
-  #map { height: 380px; }
+  #map { height: clamp(380px, 50vh, 760px); }   /* taller on a taller screen */
   .pack-marker { width: 14px; height: 14px; border-radius: 50%; background: var(--red);
                  border: 3px solid #fff; box-shadow: 0 0 0 1px var(--hairline); }
   /* network position (AWS Device Location from WiFi / cell): a different
@@ -176,7 +178,9 @@
   .maplegend i.net { background: var(--s1); box-shadow: 0 0 0 3px rgba(42,120,214,.18); }
 
   /* ---- views: the fleet (up to three packs side by side) and one pack ---- */
-  body[data-view="fleet"] .packonly, body[data-view="pack"] .fleetonly { display: none; }
+  /* !important: hiding the other view always wins over a section's own layout
+     (#fleetView is display:flex) */
+  body[data-view="fleet"] .packonly, body[data-view="pack"] .fleetonly { display: none !important; }
   .viewseg button { font-size: 1.05rem; }
 
   /* ---- fleet: one card per selected pack, same layout and scales in each
@@ -186,9 +190,8 @@
   @media (min-width: 960px) {             /* a card keeps its width whatever the count */
     .fleet { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   }
-  /* the fleet uses the screen: full width (to a cap), the cards across the
-     top, and the map takes whatever height the window has left below them */
-  body[data-view="fleet"] main, body[data-view="fleet"] footer { max-width: 2400px; }
+  /* the fleet: the cards across the top, and the map takes whatever height
+     the window has left below them */
   #fleetView { display: flex; flex-direction: column;
                min-height: calc(100vh - var(--hdr, 72px) - 3rem); }
   .fleet-wrap { flex: 1; display: flex; flex-direction: column; gap: 1rem; }
@@ -293,7 +296,7 @@
   .whoami { font-size: .8rem; color: var(--muted); }
 
   .err { color: var(--red-dk); font-size: .85rem; margin-top: 1rem; min-height: 1.2em; }
-  footer { max-width: 1180px; margin: 0 auto; padding: 0 1.5rem 2rem;
+  footer { max-width: 2400px; margin: 0 auto; padding: 0 1.5rem 2rem;
            color: var(--muted); font-size: .8rem; }
   code { background: rgba(51,62,72,.07); padding: .1rem .35rem; border-radius: 4px; }
 </style>
