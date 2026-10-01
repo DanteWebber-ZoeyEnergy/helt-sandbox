@@ -547,7 +547,7 @@ sample data. Not yet seen with real data: HELT-0002 runs firmware without the
 block until it is flashed. `fake_pack.py` sends no cells, so the cards stay
 hidden for SANDBOX-* packs.
 
-**Built (2026-10-01): fleet view.** The dashboard opens on a fleet view: up
+**Done (2026-10-01): fleet view.** The dashboard opens on a fleet view: up
 to three packs side by side (each card picks its pack; picking one another
 card holds swaps them; the choice is kept in `localStorage` `helt_fleet`),
 each card the same layout on the same scales -- status + system state, SoC
@@ -565,9 +565,13 @@ also keeps the newest row per field when a field comes back once per
 `ts_synced` table); the pack view then widens its range to cover the last
 readings and hides cards whose only value is that old reading. Previewed
 against `helt_prod` (HELT-0001..0003) through the working-tree query Lambda
-run locally, as ops and as a core/health/location customer. Deploy order:
-`sandbox-query` first (an old Lambda ignores `lookback`, so offline cards
-just read "No recent readings"), then push `main` for Pages.
+run locally, as ops and as a core/health/location customer. Deployed with
+the user's go-ahead in that order -- `sandbox-query` first (its live code
+matched `6b3dfe2`; `Successful` 12:00Z; checked after: default `/latest`
+unchanged, `lookback=30d` answers HELT-0001's last reading, histories /
+faults / a customer's 403 unchanged, no errors logged), then `main` pushed
+for Pages (an old Lambda would just ignore `lookback`: offline cards read
+"No recent readings").
 
 **Next for the real pack:** the firmware repo's open issue on the internal-RAM
 budget with Wi-Fi up (instrument the boot, trim the Wi-Fi buffer pools, LVGL
