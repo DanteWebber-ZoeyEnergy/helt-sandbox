@@ -1359,8 +1359,8 @@ L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png",
   { maxZoom: 19, attribution: "&copy; OpenStreetMap contributors" }).addTo(map);
 map.setView([-33.9249, 18.4241], 13);
 // The GNSS path: solid, dotted across gaps in readings, red arrowheads for
-// the direction. From /track (1-min steps at 6h / 24h, so a drive follows
-// the road) once it answers, else from the chart data (the range's coarser
+// the direction. From /track (15-s steps up to 24h, so a drive follows the
+// road) once it answers, else from the chart data (the range's coarser
 // windows). Network positions stay apart, as faint circles.
 const trail = L.polyline([], { color: "#c23c33", weight: 3, opacity: .8 }).addTo(map);
 const trailGap = L.polyline([], { color: "#c23c33", weight: 3, opacity: .8,

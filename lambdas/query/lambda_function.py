@@ -412,8 +412,10 @@ def history_data(pack_id, field, rng):
 NET_POS_FIELDS = ("net_lat", "net_lon", "net_acc_m")
 # /track windows: finer than RANGES' (sized for charts), so a drive follows
 # the road -- a moving pack samples every 10 s, and a 5-min mean at 60 km/h
-# cuts corners by 5 km. A parked pack's 1-min means sit within GNSS wander.
-TRACK_EVERY = {"15m": None, "1h": "15s", "6h": "1m", "24h": "1m", "7d": "5m"}
+# cuts corners by 5 km. 15 s keeps nearly every reading (a parked pack sends
+# one per 30 s): 24 h measured ~2x the 1-min size (worst pack 278 KB CSV in,
+# 151 KB JSON out, 2026-10-01), same single query.
+TRACK_EVERY = {"15m": None, "1h": "15s", "6h": "15s", "24h": "15s", "7d": "5m"}
 
 
 def track_data(pack_id, rng):

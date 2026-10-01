@@ -281,7 +281,7 @@ response is entitlement-filtered per user — see §7 and `API_ACCESS.md`):
 - `GET /packs/{pack_id}/track?range=1h` → `{series:[{t,lat,lon},...],
   net:[{t,lat,lon,acc},...]}` — the positions for a map trail in one query:
   GNSS fixes (a mean per window) and network positions (the window's last),
-  on finer windows than the charts (`TRACK_EVERY`: 1 min for 6h / 24h) so a
+  on finer windows than the charts (`TRACK_EVERY`: 15 s up to 24h) so a
   drive follows the road; samples with `ts_synced` false are left out. Every
   position read (latest, histories, history, track) drops a 0,0 GNSS fix
   before aggregating (`DROP_NULL_ISLAND`; HELT-0001 sent two on 2026-09-30)
@@ -583,7 +583,8 @@ over the last 24 h (`/track?range=24h`, every 5 min per pack): the GNSS fix
 where there was one, else the network position; a point within the
 uncertainty of the last kept one (GNSS 25 m, network its accuracy) is the
 same place, so a parked pack draws nothing. Solid while readings kept
-coming, dotted across a gap over 30 min; small arrowheads every ~70 px on
+coming, dotted across a gap over 30 min (15-s steps since 2026-10-01: ~2x
+the 1-min download, same single query); small arrowheads every ~70 px on
 screen show the direction; hovering a card or a path brings that pack's
 path forward (packs carried together share a road). Deployed with the
 user's go-ahead (query Lambda first, then Pages). The pack view's red GNSS
