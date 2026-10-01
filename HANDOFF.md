@@ -586,7 +586,10 @@ same place, so a parked pack draws nothing. Solid while readings kept
 coming, dotted across a gap over 30 min; small arrowheads every ~70 px on
 screen show the direction; hovering a card or a path brings that pack's
 path forward (packs carried together share a road). Deployed with the
-user's go-ahead (query Lambda first, then Pages).
+user's go-ahead (query Lambda first, then Pages). The pack view's red GNSS
+path uses the same `/track` (its own range, re-read every 2 min, the chart
+data's coarser path until it answers), simplification, dotted gaps and
+arrowheads (red); network positions stay faint circles.
 
 **Next for the real pack:** the firmware repo's open issue on the internal-RAM
 budget with Wi-Fi up (instrument the boot, trim the Wi-Fi buffer pools, LVGL

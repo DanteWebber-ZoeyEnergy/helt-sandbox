@@ -178,10 +178,12 @@
   .maplegend i.net { background: var(--s1); box-shadow: 0 0 0 3px rgba(42,120,214,.18); }
   .maplegend i.trail { width: 16px; height: 3px; border-radius: 2px; background: var(--ink);
                        vertical-align: 2px; }
+  .maplegend i.trail.gnss { background: var(--red); }
   /* fleet trails: a small arrowhead every ~70 px of path, pointing the way the
      pack went; ink with a surface edge so it reads on any map tile */
   .trail-arrow { display: block; width: 10px; height: 10px; overflow: visible; }
   .trail-arrow path { fill: var(--ink); stroke: #fff; stroke-width: 1; stroke-linejoin: round; }
+  .trail-arrow.gnss path { fill: var(--red); }   /* the pack view's GNSS path is red */
 
   /* ---- views: the fleet (up to three packs side by side) and one pack ---- */
   /* !important: hiding the other view always wins over a section's own layout
@@ -466,6 +468,7 @@
       <span class="maplegend">
         <span id="lgGnss" hidden><i class="gnss"></i>GNSS</span>
         <span id="lgNet" hidden><i class="net"></i>Network (WiFi / cell) ± accuracy</span>
+        <span id="lgPath" hidden><i class="trail gnss"></i>GNSS path (arrows: direction; dotted: no readings)</span>
       </span>
       <span class="coords" id="coords">–</span>
       <button type="button" class="mapbtn" aria-pressed="false">⤢ Full screen</button>
@@ -1282,12 +1285,124 @@ function fitRangeTo(pid) {
   setRange(RANGES.find(r => RANGE_S[r] >= need) || RANGES[RANGES.length - 1]);
 }
 
+/* ------------------------- map paths (both maps) -------------------------- */
+const TRAIL_MIN_M = 25;                   // GNSS wander below this is not movement
+const TRAIL_GAP_S = 30 * 60;              // no reading for this long: route unknown
+const ARROW_EVERY_PX = 70;                // one arrowhead per this much path on screen
+const INK = "#333e48";                    // --ink (Leaflet styles take no CSS vars)
+
+// pts oldest first, each {t, lat, lon, acc}. A point closer to the last kept
+// one than either's uncertainty (GNSS: TRAIL_MIN_M, network: its accuracy) is
+// the same place, so a parked pack draws no path; `tEnd` keeps how long it
+// stayed there, so a later gap means no readings, not a long stop.
+function simplifyPath(pts) {
+  const kept = [];
+  for (const p of pts) {
+    const prev = kept.at(-1);
+    if (prev && L.latLng(prev.lat, prev.lon).distanceTo([p.lat, p.lon]) <
+                Math.max(TRAIL_MIN_M, prev.acc || 0, p.acc || 0)) {
+      prev.tEnd = p.t;
+      continue;
+    }
+    kept.push({ ...p, tEnd: p.t });
+  }
+  return kept.length >= 2 ? kept : null;
+}
+
+// Solid while readings kept coming; dotted (a straight line, the real route
+// unknown) across a gap of more than TRAIL_GAP_S. Leaflet multi-line arrays.
+function splitRuns(pts) {
+  const ll = p => [p.lat, p.lon];
+  const runs = [[pts[0]]], gaps = [];
+  for (let i = 1; i < pts.length; i++) {
+    if (pts[i].t - pts[i - 1].tEnd > TRAIL_GAP_S) { gaps.push([pts[i - 1], pts[i]]); runs.push([pts[i]]); }
+    else runs.at(-1).push(pts[i]);
+  }
+  return { solid: runs.filter(r => r.length > 1).map(r => r.map(ll)),
+           dotted: gaps.map(g => g.map(ll)) };
+}
+
+// Arrowheads in screen space, so they are evenly spaced at any zoom: walk the
+// path on screen, one every ARROW_EVERY_PX (a short path gets one, mid-way),
+// placing only those in view -- the caller redraws after every pan / zoom.
+// Needs a "trailArrows" pane on lmap; returns the markers.
+function placeArrows(lmap, layer, pts, { cls = "", opacity = 1 } = {}) {
+  const out = [];
+  const view = lmap.getBounds().pad(0.1);
+  const xy = pts.map(p => lmap.latLngToLayerPoint([p.lat, p.lon]));
+  let total = 0;
+  for (let i = 1; i < xy.length; i++) total += xy[i - 1].distanceTo(xy[i]);
+  if (total < 8) return out;                     // a dot on screen: no direction to show
+  let next = Math.min(ARROW_EVERY_PX / 2, total / 2), walked = 0;
+  for (let i = 1; i < xy.length; i++) {
+    const a = xy[i - 1], b = xy[i], len = a.distanceTo(b);
+    const deg = Math.atan2(b.y - a.y, b.x - a.x) * 180 / Math.PI;
+    while (next <= walked + len) {
+      const f = len ? (next - walked) / len : 0;
+      const at = lmap.layerPointToLatLng(L.point(a.x + (b.x - a.x) * f, a.y + (b.y - a.y) * f));
+      if (view.contains(at)) {
+        out.push(L.marker(at, { pane: "trailArrows", interactive: false, keyboard: false, opacity,
+          icon: L.divIcon({ className: "", iconSize: [10, 10], iconAnchor: [5, 5],
+            html: `<svg class="trail-arrow ${cls}" viewBox="-5 -5 10 10" style="transform:rotate(${deg.toFixed(0)}deg)">` +
+                  `<path d="M-3.5,-3.5 L4,0 L-3.5,3.5 Z"/></svg>` }) }).addTo(layer));
+      }
+      next += ARROW_EVERY_PX;
+    }
+    walked += len;
+  }
+  return out;
+}
+
 /* --------------------------------- map ----------------------------------- */
 const map = L.map("map", { zoomControl: true, attributionControl: true });
 L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png",
   { maxZoom: 19, attribution: "&copy; OpenStreetMap contributors" }).addTo(map);
 map.setView([-33.9249, 18.4241], 13);
+// The GNSS path: solid, dotted across gaps in readings, red arrowheads for
+// the direction. From /track (1-min steps at 6h / 24h, so a drive follows
+// the road) once it answers, else from the chart data (the range's coarser
+// windows). Network positions stay apart, as faint circles.
 const trail = L.polyline([], { color: "#c23c33", weight: 3, opacity: .8 }).addTo(map);
+const trailGap = L.polyline([], { color: "#c23c33", weight: 3, opacity: .8,
+                                  dashArray: "1 7", lineCap: "round" }).addTo(map);
+map.createPane("trailArrows").style.zIndex = 450;   // above the path, under the marker
+const packArrows = L.layerGroup().addTo(map);
+const PACK_TRACK_MS = 2 * 60 * 1000;      // the fine path is re-read every 2 min
+let histTrailPts = [];                    // the path from the chart data
+let packTrack = null, packTrackKey = "", packTrackAt = 0, packTrackOk = true;
+let packTrailPts = null;                  // the path as drawn (simplified)
+function drawPackTrail() {
+  const fine = packTrack && packTrackKey === `${PACK}|${range}`;
+  const raw = fine ? (packTrack.series || []).map(p => ({ t: p.t, lat: p.lat, lon: p.lon, acc: 0 }))
+                   : histTrailPts;
+  packTrailPts = simplifyPath(raw);
+  const { solid, dotted } = packTrailPts ? splitRuns(packTrailPts) : { solid: [], dotted: [] };
+  trail.setLatLngs(solid);
+  trailGap.setLatLngs(dotted);
+  $("lgPath").hidden = !packTrailPts;
+  drawPackArrows();
+}
+function drawPackArrows() {
+  packArrows.clearLayers();
+  if (packTrailPts) placeArrows(map, packArrows, packTrailPts, { cls: "gnss" });
+}
+map.on("moveend", drawPackArrows);
+async function loadPackTrack() {
+  if (!packTrackOk) return;
+  const key = `${PACK}|${range}`;
+  if (key === packTrackKey && Date.now() - packTrackAt < PACK_TRACK_MS) return;
+  try {
+    const d = await getJSON(`/packs/${encodeURIComponent(PACK)}/track?range=${range}`);
+    if (`${PACK}|${range}` !== key) return;        // pack or range changed meanwhile
+    packTrack = d; packTrackKey = key; packTrackAt = Date.now();
+    drawPackTrail();
+  } catch (e) {
+    // not entitled to 'location', or a Lambda without /track: the chart
+    // data's path stays
+    if (/^403|API 404/.test(String(e.message))) packTrackOk = false;
+    else console.warn("track:", e);
+  }
+}
 const marker = L.marker([-33.9249, 18.4241],
   { icon: L.divIcon({ className: "", html: '<div class="pack-marker"></div>',
                       iconSize: [14, 14], iconAnchor: [7, 7] }) }).addTo(map);
@@ -1444,10 +1559,11 @@ function applyBundle(series) {
   if (sf && (series[sf.countKey] || []).length) cards[sf.key].hidden = false;
 
   const lonByT = new Map((series.lon || []).map(p => [p.t, p.v]));
-  const pts = (series.lat || [])
+  histTrailPts = (series.lat || [])
     .filter(p => lonByT.has(p.t))
-    .map(p => [p.v, lonByT.get(p.t)]);
-  trail.setLatLngs(pts);
+    .map(p => ({ t: p.t, lat: p.v, lon: lonByT.get(p.t), acc: 0 }));
+  const pts = histTrailPts.map(p => [p.lat, p.lon]);
+  drawPackTrail();
 
   // network positions in the range: one faint circle per distinct position
   // (the pack reports the same one in every sample while it holds)
@@ -1508,6 +1624,7 @@ async function refreshHistory() {
   $("charts").classList.add("loading");
   const failed = [];
   loadFaults();                             // its own call, alongside the bundle
+  loadPackTrack();                          // the fine GNSS path, every 2 min
   try {
     // preferred: every field + the GPS trail in ONE API call (one InfluxDB
     // query server-side — the query bill is the dominant cost)
@@ -1586,6 +1703,11 @@ function selectPack(pid) {
   faultList.replaceChildren();
   $("sysState").textContent = "";
   trail.setLatLngs([]);
+  trailGap.setLatLngs([]);
+  packArrows.clearLayers();
+  histTrailPts = []; packTrailPts = null;
+  packTrack = null; packTrackKey = ""; packTrackOk = true;
+  $("lgPath").hidden = true;
   netTrail.clearLayers();
   netNow.clearLayers();
   mapFitted = false;                                // re-center on the new pack
@@ -1740,16 +1862,10 @@ fleetMap.createPane("trailArrows").style.zIndex = 450;
 const trailLayer = L.layerGroup().addTo(fleetMap);
 const arrowLayer = L.layerGroup().addTo(fleetMap);
 const TRAIL_RANGE = "24h";
-const TRAIL_MIN_M = 25;                   // GNSS wander below this is not movement
-const TRAIL_GAP_S = 30 * 60;              // no reading for this long: route unknown
-const ARROW_EVERY_PX = 70;                // one arrowhead per this much path on screen
-const INK = "#333e48";                    // --ink (Leaflet styles take no CSS vars)
 
 // The path a pack took: its GNSS fix where it had one, else its network
-// position, oldest first, ending at where the pack is now. A point closer to
-// the last kept one than either's uncertainty (GNSS: TRAIL_MIN_M, network:
-// its accuracy) is the same place, so a parked pack draws no path; `tEnd`
-// keeps how long it stayed, so a gap means no readings, not a long stop.
+// position, oldest first, ending at where the pack is now (simplifyPath drops
+// what is the same place within either point's uncertainty).
 function trailPoints(track, pos) {
   if (!track) return null;
   const pts = (track.series || []).map(p => ({ t: p.t, lat: p.lat, lon: p.lon, acc: 0 }));
@@ -1762,17 +1878,7 @@ function trailPoints(track, pos) {
   if (pos && pos.t && pos.t >= since && (!pts.length || pos.t > pts.at(-1).t)) {
     pts.push({ t: pos.t, lat: pos.lat, lon: pos.lon, acc: pos.acc || 0 });
   }
-  const kept = [];
-  for (const p of pts) {
-    const prev = kept.at(-1);
-    if (prev && L.latLng(prev.lat, prev.lon).distanceTo([p.lat, p.lon]) <
-                Math.max(TRAIL_MIN_M, prev.acc, p.acc)) {
-      prev.tEnd = p.t;
-      continue;
-    }
-    kept.push({ ...p, tEnd: p.t });
-  }
-  return kept.length >= 2 ? kept : null;
+  return simplifyPath(pts);
 }
 
 // Hovering a pack's card or path brings its path forward and fades the
@@ -1792,18 +1898,8 @@ function focusTrail(target) {
 
 function drawTrail(s) {
   s.trailLines = [];
-  const pts = s.trailPts;
-  if (!pts) return;
-  const ll = p => [p.lat, p.lon];
-  // solid while readings kept coming; dotted across a gap (straight line,
-  // the real route is unknown)
-  const runs = [[pts[0]]], gaps = [];
-  for (let i = 1; i < pts.length; i++) {
-    if (pts[i].t - pts[i - 1].tEnd > TRAIL_GAP_S) { gaps.push([pts[i - 1], pts[i]]); runs.push([pts[i]]); }
-    else runs.at(-1).push(pts[i]);
-  }
-  const solid = runs.filter(r => r.length > 1).map(r => r.map(ll));
-  const dotted = gaps.map(g => g.map(ll));
+  if (!s.trailPts) return;
+  const { solid, dotted } = splitRuns(s.trailPts);
   const tip = `${s.pid} · path, last 24 h`;
   const line = (lls, opt) => {
     const l = L.polyline(lls, { pane: "trails", ...opt, baseOpacity: opt.opacity }).addTo(trailLayer);
@@ -1823,37 +1919,14 @@ function drawTrail(s) {
   }
 }
 
-// Arrowheads in screen space, so they are evenly spaced at any zoom: walk each
-// path on screen, one every ARROW_EVERY_PX (a short path gets one, mid-way),
-// placing only those in view. Redrawn after every pan / zoom.
+// the arrowheads, redrawn after every pan / zoom (placeArrows)
 function drawArrows() {
   arrowLayer.clearLayers();
-  const view = fleetMap.getBounds().pad(0.1);
   for (const s of slots) {
-    s.arrows = [];
-    if (!s.pid || !s.trailPts) continue;
-    const xy = s.trailPts.map(p => fleetMap.latLngToLayerPoint([p.lat, p.lon]));
-    let total = 0;
-    for (let i = 1; i < xy.length; i++) total += xy[i - 1].distanceTo(xy[i]);
-    if (total < 8) continue;                       // a dot on screen: no direction to show
-    let next = Math.min(ARROW_EVERY_PX / 2, total / 2), walked = 0;
-    for (let i = 1; i < xy.length; i++) {
-      const a = xy[i - 1], b = xy[i], len = a.distanceTo(b);
-      const deg = Math.atan2(b.y - a.y, b.x - a.x) * 180 / Math.PI;
-      while (next <= walked + len) {
-        const f = len ? (next - walked) / len : 0;
-        const at = fleetMap.layerPointToLatLng(L.point(a.x + (b.x - a.x) * f, a.y + (b.y - a.y) * f));
-        if (view.contains(at)) {
-          s.arrows.push(L.marker(at, { pane: "trailArrows", interactive: false, keyboard: false,
-            opacity: trailFocus && trailFocus !== s ? .4 : 1,
-            icon: L.divIcon({ className: "", iconSize: [10, 10], iconAnchor: [5, 5],
-              html: `<svg class="trail-arrow" viewBox="-5 -5 10 10" style="transform:rotate(${deg.toFixed(0)}deg)">` +
-                    `<path d="M-3.5,-3.5 L4,0 L-3.5,3.5 Z"/></svg>` }) }).addTo(arrowLayer));
-        }
-        next += ARROW_EVERY_PX;
-      }
-      walked += len;
-    }
+    s.arrows = s.pid && s.trailPts
+      ? placeArrows(fleetMap, arrowLayer, s.trailPts,
+                    { opacity: trailFocus && trailFocus !== s ? .4 : 1 })
+      : [];
   }
 }
 fleetMap.on("moveend", drawArrows);
