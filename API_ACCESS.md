@@ -99,7 +99,7 @@ All are `GET`, all return JSON.
 | `/packs/{pack_id}/latest` | newest value of each field you're entitled to, from the last 15 min; add `?lookback=24h`, `7d` or `30d` to reach further back (an offline pack's last reading) |
 | `/packs/{pack_id}/histories?range=1h` | all entitled fields' history in one call |
 | `/packs/{pack_id}/history?field=soc_pct&range=1h` | one field's history |
-| `/packs/{pack_id}/track?range=1h` | GPS trail (location entitlement only) |
+| `/packs/{pack_id}/track?range=1h` | the pack's positions for a map trail: `{series:[{t, lat, lon}], net:[{t, lat, lon, acc}]}` -- GNSS fixes and network positions, on finer windows than the charts (location entitlement only) |
 | `/packs/{pack_id}/faults?range=1h` | the pack's faults, newest first: `{faults:[{t, src, code}]}` (ops entitlement only) |
 
 `range` is one of `15m, 1h, 6h, 24h, 7d` (longer ranges are downsampled

@@ -278,8 +278,13 @@ response is entitlement-filtered per user — see §7 and `API_ACCESS.md`):
 - `GET /packs/{pack_id}/history?field=soc_pct&range=1h` → `{series:[{t,v},...]}`
   (`range` ∈ 15m, 1h, 6h, 24h, 7d; ranges beyond 15m are server-side
   downsampled via `aggregateWindow` mean to keep any range at ~200–400 points)
-- `GET /packs/{pack_id}/track?range=1h` → `{series:[{t,lat,lon},...]}` — GPS
-  trail for the map (lat/lon pivoted into pairs, same downsampling)
+- `GET /packs/{pack_id}/track?range=1h` → `{series:[{t,lat,lon},...],
+  net:[{t,lat,lon,acc},...]}` — the positions for a map trail in one query:
+  GNSS fixes (a mean per window) and network positions (the window's last),
+  on finer windows than the charts (`TRACK_EVERY`: 1 min for 6h / 24h) so a
+  drive follows the road; samples with `ts_synced` false are left out. Every
+  position read (latest, histories, history, track) drops a 0,0 GNSS fix
+  before aggregating (`DROP_NULL_ISLAND`; HELT-0001 sent two on 2026-09-30)
 
 All query-Lambda responses are cached in-container for 30 s so N viewers share
 one InfluxDB query per window — query executions are the dominant variable
@@ -572,6 +577,16 @@ unchanged, `lookback=30d` answers HELT-0001's last reading, histories /
 faults / a customer's 403 unchanged, no errors logged), then `main` pushed
 for Pages (an old Lambda would just ignore `lookback`: offline cards read
 "No recent readings").
+
+**Done (2026-10-01): fleet trails.** The fleet map draws each pack's path
+over the last 24 h (`/track?range=24h`, every 5 min per pack): the GNSS fix
+where there was one, else the network position; a point within the
+uncertainty of the last kept one (GNSS 25 m, network its accuracy) is the
+same place, so a parked pack draws nothing. Solid while readings kept
+coming, dotted across a gap over 30 min; small arrowheads every ~70 px on
+screen show the direction; hovering a card or a path brings that pack's
+path forward (packs carried together share a road). Deployed with the
+user's go-ahead (query Lambda first, then Pages).
 
 **Next for the real pack:** the firmware repo's open issue on the internal-RAM
 budget with Wi-Fi up (instrument the boot, trim the Wi-Fi buffer pools, LVGL
