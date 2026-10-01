@@ -176,6 +176,12 @@
                  margin-right: .3rem; vertical-align: -1px; }
   .maplegend i.gnss { background: var(--red); }
   .maplegend i.net { background: var(--s1); box-shadow: 0 0 0 3px rgba(42,120,214,.18); }
+  .maplegend i.trail { width: 16px; height: 3px; border-radius: 2px; background: var(--ink);
+                       vertical-align: 2px; }
+  /* fleet trails: a small arrowhead every ~70 px of path, pointing the way the
+     pack went; ink with a surface edge so it reads on any map tile */
+  .trail-arrow { display: block; width: 10px; height: 10px; overflow: visible; }
+  .trail-arrow path { fill: var(--ink); stroke: #fff; stroke-width: 1; stroke-linejoin: round; }
 
   /* ---- views: the fleet (up to three packs side by side) and one pack ---- */
   /* !important: hiding the other view always wins over a section's own layout
@@ -412,6 +418,7 @@
           <span class="maplegend">
             <span><i class="gnss"></i>GNSS fix</span>
             <span><i class="net"></i>Network (WiFi / cell) ± accuracy</span>
+            <span id="lgTrail" hidden><i class="trail"></i>Path, last 24 h (arrows: direction; dotted: no readings)</span>
           </span>
           <button type="button" class="mapbtn" aria-pressed="false">⤢ Full screen</button>
         </div>
@@ -1726,6 +1733,130 @@ L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png",
   { maxZoom: 19, attribution: "&copy; OpenStreetMap contributors" }).addTo(fleetMap);
 fleetMap.setView([-33.9249, 18.4241], 11);
 const fleetLayer = L.layerGroup().addTo(fleetMap);
+// Each pack's path over the last 24 h, under the markers: the line in its own
+// pane above the accuracy circles, the arrowheads above the line.
+fleetMap.createPane("trails").style.zIndex = 420;
+fleetMap.createPane("trailArrows").style.zIndex = 450;
+const trailLayer = L.layerGroup().addTo(fleetMap);
+const arrowLayer = L.layerGroup().addTo(fleetMap);
+const TRAIL_RANGE = "24h";
+const TRAIL_MIN_M = 25;                   // GNSS wander below this is not movement
+const TRAIL_GAP_S = 30 * 60;              // no reading for this long: route unknown
+const ARROW_EVERY_PX = 70;                // one arrowhead per this much path on screen
+const INK = "#333e48";                    // --ink (Leaflet styles take no CSS vars)
+
+// The path a pack took: its GNSS fix where it had one, else its network
+// position, oldest first, ending at where the pack is now. A point closer to
+// the last kept one than either's uncertainty (GNSS: TRAIL_MIN_M, network:
+// its accuracy) is the same place, so a parked pack draws no path; `tEnd`
+// keeps how long it stayed, so a gap means no readings, not a long stop.
+function trailPoints(track, pos) {
+  if (!track) return null;
+  const pts = (track.series || []).map(p => ({ t: p.t, lat: p.lat, lon: p.lon, acc: 0 }));
+  const gnssT = new Set(pts.map(p => p.t));
+  for (const p of track.net || []) {
+    if (!gnssT.has(p.t)) pts.push({ t: p.t, lat: p.lat, lon: p.lon, acc: p.acc || 0 });
+  }
+  pts.sort((a, b) => a.t - b.t);
+  const since = Date.now() / 1000 - RANGE_S[TRAIL_RANGE];
+  if (pos && pos.t && pos.t >= since && (!pts.length || pos.t > pts.at(-1).t)) {
+    pts.push({ t: pos.t, lat: pos.lat, lon: pos.lon, acc: pos.acc || 0 });
+  }
+  const kept = [];
+  for (const p of pts) {
+    const prev = kept.at(-1);
+    if (prev && L.latLng(prev.lat, prev.lon).distanceTo([p.lat, p.lon]) <
+                Math.max(TRAIL_MIN_M, prev.acc, p.acc)) {
+      prev.tEnd = p.t;
+      continue;
+    }
+    kept.push({ ...p, tEnd: p.t });
+  }
+  return kept.length >= 2 ? kept : null;
+}
+
+// Hovering a pack's card or path brings its path forward and fades the
+// others (packs carried together share a road, and their paths overlap).
+let trailFocus = null;
+function focusTrail(target) {
+  trailFocus = target;
+  for (const s of slots) {
+    const dim = !!target && target !== s;
+    for (const l of s.trailLines || []) {
+      l.setStyle({ opacity: l.options.baseOpacity * (dim ? .4 : 1) });
+      if (target === s) l.bringToFront();
+    }
+    for (const m of s.arrows || []) m.setOpacity(dim ? .4 : 1);
+  }
+}
+
+function drawTrail(s) {
+  s.trailLines = [];
+  const pts = s.trailPts;
+  if (!pts) return;
+  const ll = p => [p.lat, p.lon];
+  // solid while readings kept coming; dotted across a gap (straight line,
+  // the real route is unknown)
+  const runs = [[pts[0]]], gaps = [];
+  for (let i = 1; i < pts.length; i++) {
+    if (pts[i].t - pts[i - 1].tEnd > TRAIL_GAP_S) { gaps.push([pts[i - 1], pts[i]]); runs.push([pts[i]]); }
+    else runs.at(-1).push(pts[i]);
+  }
+  const solid = runs.filter(r => r.length > 1).map(r => r.map(ll));
+  const dotted = gaps.map(g => g.map(ll));
+  const tip = `${s.pid} · path, last 24 h`;
+  const line = (lls, opt) => {
+    const l = L.polyline(lls, { pane: "trails", ...opt, baseOpacity: opt.opacity }).addTo(trailLayer);
+    s.trailLines.push(l);
+    if (opt.interactive !== false) {
+      l.on("mouseover", () => focusTrail(s)).on("mouseout", () => focusTrail(null));
+    }
+    return l;
+  };
+  line([...solid, ...dotted], { color: "#fff", weight: 6, opacity: .75, interactive: false });
+  if (solid.length) {
+    line(solid, { color: INK, weight: 2.5, opacity: .9 }).bindTooltip(tip, { sticky: true });
+  }
+  if (dotted.length) {
+    line(dotted, { color: INK, weight: 2.5, opacity: .9, dashArray: "1 6", lineCap: "round" })
+      .bindTooltip(tip + " · no readings here", { sticky: true });
+  }
+}
+
+// Arrowheads in screen space, so they are evenly spaced at any zoom: walk each
+// path on screen, one every ARROW_EVERY_PX (a short path gets one, mid-way),
+// placing only those in view. Redrawn after every pan / zoom.
+function drawArrows() {
+  arrowLayer.clearLayers();
+  const view = fleetMap.getBounds().pad(0.1);
+  for (const s of slots) {
+    s.arrows = [];
+    if (!s.pid || !s.trailPts) continue;
+    const xy = s.trailPts.map(p => fleetMap.latLngToLayerPoint([p.lat, p.lon]));
+    let total = 0;
+    for (let i = 1; i < xy.length; i++) total += xy[i - 1].distanceTo(xy[i]);
+    if (total < 8) continue;                       // a dot on screen: no direction to show
+    let next = Math.min(ARROW_EVERY_PX / 2, total / 2), walked = 0;
+    for (let i = 1; i < xy.length; i++) {
+      const a = xy[i - 1], b = xy[i], len = a.distanceTo(b);
+      const deg = Math.atan2(b.y - a.y, b.x - a.x) * 180 / Math.PI;
+      while (next <= walked + len) {
+        const f = len ? (next - walked) / len : 0;
+        const at = fleetMap.layerPointToLatLng(L.point(a.x + (b.x - a.x) * f, a.y + (b.y - a.y) * f));
+        if (view.contains(at)) {
+          s.arrows.push(L.marker(at, { pane: "trailArrows", interactive: false, keyboard: false,
+            opacity: trailFocus && trailFocus !== s ? .4 : 1,
+            icon: L.divIcon({ className: "", iconSize: [10, 10], iconAnchor: [5, 5],
+              html: `<svg class="trail-arrow" viewBox="-5 -5 10 10" style="transform:rotate(${deg.toFixed(0)}deg)">` +
+                    `<path d="M-3.5,-3.5 L4,0 L-3.5,3.5 Z"/></svg>` }) }).addTo(arrowLayer));
+        }
+        next += ARROW_EVERY_PX;
+      }
+      walked += len;
+    }
+  }
+}
+fleetMap.on("moveend", drawArrows);
 let fleetFitKey = "";
 function setFleetMapVisible(v) {
   const card = $("fleetMapCard"), was = card.style.display !== "none";
@@ -1746,7 +1877,8 @@ function saveFleet() {
 
 function makeSlot(i) {
   const s = { i, pid: "", d: null, err: "", seen: undefined, pos: null, marker: null,
-              sparkAt: 0, faults: null, faultsAt: 0, faultsOk: true, el: {} };
+              sparkAt: 0, faults: null, faultsAt: 0, faultsOk: true,
+              track: null, trackAt: 0, trackOk: true, trailPts: null, el: {} };
   const e = s.el, mk = (tag, cls, parent) => {
     const x = document.createElement(tag);
     if (cls) x.className = cls;
@@ -1754,6 +1886,8 @@ function makeSlot(i) {
     return x;
   };
   e.card = mk("article", "pcard", $("fleet"));
+  e.card.addEventListener("mouseenter", () => { if (s.trailPts) focusTrail(s); });
+  e.card.addEventListener("mouseleave", () => focusTrail(null));
   const top = mk("div", "top", e.card);
   e.sel = mk("select", "packsel", top);
   e.sel.setAttribute("aria-label", `Pack in card ${i + 1}`);
@@ -1794,7 +1928,8 @@ for (let i = 0; i < FLEET_SLOTS; i++) slots.push(makeSlot(i));
 function setSlotPack(s, pid) {
   if (s.pid === pid) return;
   Object.assign(s, { pid, d: null, err: "", seen: undefined, pos: null, marker: null,
-                     sparkAt: 0, faults: null, faultsAt: 0, faultsOk: true });
+                     sparkAt: 0, faults: null, faultsAt: 0, faultsOk: true,
+                     track: null, trackAt: 0, trackOk: true, trailPts: null });
   s.el.sel.value = pid;
   s.spark.set(null);
   renderSlot(s);
@@ -1933,9 +2068,13 @@ const FAULTS_SHOWN = 200;                  // the API's cap on /faults rows
 
 function renderFleetMap() {
   fleetLayer.clearLayers();
+  trailLayer.clearLayers();
   const pts = [];
   for (const s of slots) {
     s.marker = null;
+    s.trailPts = s.pid ? trailPoints(s.track, s.pos) : null;
+    drawTrail(s);
+    for (const t of s.trailPts || []) pts.push([t.lat, t.lon]);
     const p = s.pid && s.pos;
     if (!p) continue;
     const { online } = slotOnline(s);
@@ -1955,8 +2094,12 @@ function renderFleetMap() {
     pts.push([p.lat, p.lon]);
   }
   setFleetMapVisible(pts.length > 0);
-  // fit once per set of packs shown -- never fight the user's own pan/zoom
-  const key = slots.map(s => s.pid + (s.pos ? "@" : "")).join("|");
+  $("lgTrail").hidden = !slots.some(s => s.trailPts);
+  drawArrows();
+  if (trailFocus) focusTrail(trailFocus.trailPts ? trailFocus : null);
+  // fit once per set of packs shown (and when a path arrives), never
+  // fighting the user's own pan/zoom
+  const key = slots.map(s => s.pid + (s.pos ? "@" : "") + (s.trailPts ? "~" : "")).join("|");
   if (pts.length && key !== fleetFitKey) {
     fleetFitKey = key;
     setTimeout(() => {
@@ -2003,6 +2146,17 @@ async function refreshFleet() {
           if (s.pid === pid && String(e.message).startsWith("403")) {
             s.sparkAt = Date.now(); s.spark.set([]);
           }
+        }));
+      }
+      if (s.trackOk && now - s.trackAt > FLEET_SLOW_MS) {
+        jobs.push(() => getJSON(`/packs/${enc}/track?range=${TRAIL_RANGE}`).then(d => {
+          if (s.pid !== pid) return;
+          s.trackAt = Date.now();
+          s.track = d;
+        }).catch(e => {
+          if (s.pid !== pid) return;
+          if (String(e.message).startsWith("403")) s.trackOk = false;   // no 'location' group
+          else console.warn(`track ${pid}:`, e);
         }));
       }
       if (s.faultsOk && now - s.faultsAt > FLEET_SLOW_MS) {

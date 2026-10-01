@@ -20,7 +20,8 @@ Routes (all require `Authorization: Bearer <access token>`):
     GET /packs/{pack_id}/history?field=soc_pct&range=1h
         -> one field (403 unless the field is in an entitled group)
     GET /packs/{pack_id}/track?range=1h
-        -> GPS trail (requires the 'location' group)
+        -> the pack's positions for a map trail: GNSS fixes (series) and
+           network positions (net) (requires the 'location' group)
     GET /packs/{pack_id}/faults?range=1h
         -> the pack's faults, newest first (requires the 'ops' group)
 
@@ -122,6 +123,14 @@ AGG_FN = {
     "ac_surge_max_w": "max",
     "si_state": "last", "bms_state": "last", "net_src": "last",
 }
+
+# A GNSS position of exactly 0,0 is a receiver without a fix that slipped
+# through (HELT-0001 sent two on 2026-09-30) -- never a place a pack was.
+# Dropped before any last() / aggregation: one in a 5-min mean lands the
+# window's position mid-ocean. Flux's `and` short-circuits, so the value
+# comparison never meets a non-float field.
+DROP_NULL_ISLAND = ('|> filter(fn:(r)=> not ((r._field=="lat" or r._field=="lon")'
+                    ' and r._value == 0.0))')
 
 # The faults route (pack_fault measurement, one point per fault) needs 'ops'.
 FAULTS_GROUP = "ops"
@@ -288,6 +297,7 @@ def latest_data(pack_id, include_status, lookback="15m"):
         f'from(bucket:"{bucket}")'
         f'|> range(start:{LOOKBACKS[lookback]})'
         f'|> filter(fn:(r)=> r._measurement=="telemetry" and r.pack_id=="{pack_id}")'
+        f'{DROP_NULL_ISLAND}'
         f'|> last()'
     )
     # telemetry_ts: when each field was last reported. Fields are not all in
@@ -365,6 +375,7 @@ def histories_data(pack_id, rng):
         f'from(bucket:"{bucket_for(pack_id)}")'
         f'|> range(start:{start})'
         f'|> filter(fn:(r)=> r._measurement=="telemetry" and r.pack_id=="{pack_id}")'
+        f'{DROP_NULL_ISLAND}'
     )
     flux = (
         f'{_downsampled(base, every)}'
@@ -388,6 +399,7 @@ def history_data(pack_id, field, rng):
         f'from(bucket:"{bucket_for(pack_id)}")'
         f'|> range(start:{start})'
         f'|> filter(fn:(r)=> r._measurement=="telemetry" and r.pack_id=="{pack_id}" and r._field=="{field}")'
+        f'{DROP_NULL_ISLAND}'
         f'{agg}'
         f'|> keep(columns:["_time","_value"])'
     )
@@ -397,23 +409,48 @@ def history_data(pack_id, field, rng):
     return series
 
 
+NET_POS_FIELDS = ("net_lat", "net_lon", "net_acc_m")
+# /track windows: finer than RANGES' (sized for charts), so a drive follows
+# the road -- a moving pack samples every 10 s, and a 5-min mean at 60 km/h
+# cuts corners by 5 km. A parked pack's 1-min means sit within GNSS wander.
+TRACK_EVERY = {"15m": None, "1h": "15s", "6h": "1m", "24h": "1m", "7d": "5m"}
+
+
 def track_data(pack_id, rng):
-    start, every = RANGES.get(rng, RANGES["1h"])
-    agg = f'|> aggregateWindow(every:{every}, fn:mean, createEmpty:false)' if every else ''
-    flux = (
+    """The pack's positions for a map trail, in ONE query: GNSS fixes (a mean
+    per window, as before) and network positions (the window's last -- a mean
+    of two network fixes is a place the pack never reported). A sample taken
+    before the pack's clock was set (ts_synced false) is left out: its time
+    is an estimate, and a trail drawn in time order would zig-zag through it."""
+    rng = rng if rng in RANGES else "1h"
+    start, every = RANGES[rng][0], TRACK_EVERY[rng]
+    base = (
         f'from(bucket:"{bucket_for(pack_id)}")'
         f'|> range(start:{start})'
         f'|> filter(fn:(r)=> r._measurement=="telemetry" and r.pack_id=="{pack_id}"'
-        f' and (r._field=="lat" or r._field=="lon"))'
-        f'{agg}'
-        f'|> pivot(rowKey:["_time"], columnKey:["_field"], valueColumn:"_value")'
-        f'|> keep(columns:["_time","lat","lon"])'
+        f' and (not exists r.ts_synced or r.ts_synced != "false")'
     )
-    series = [{"t": _iso_to_epoch(r["_time"]), "lat": _num(r["lat"]), "lon": _num(r["lon"])}
-              for r in influx_query(flux)
-              if r.get("_time") and r.get("lat") not in (None, "") and r.get("lon") not in (None, "")]
-    series.sort(key=lambda p: p["t"])
-    return series
+    gnss = f'{base} and (r._field=="lat" or r._field=="lon")){DROP_NULL_ISLAND}'
+    net = f'{base} and ({_field_is(NET_POS_FIELDS)}))'
+    if every:
+        gnss += f'|> aggregateWindow(every:{every}, fn:mean, createEmpty:false)'
+        net += f'|> aggregateWindow(every:{every}, fn:last, createEmpty:false)'
+    flux = (f'g = {gnss}\nn = {net}\n'
+            f'union(tables:[g, n])|> keep(columns:["_time","_field","_value"])')
+    by_t = {}
+    for r in influx_query(flux):
+        f, v, t = r.get("_field"), r.get("_value"), r.get("_time")
+        if f and t and v not in (None, ""):
+            by_t.setdefault(_iso_to_epoch(t), {})[f] = _num(v)
+    series, net_pts = [], []
+    for t in sorted(by_t):
+        p = by_t[t]
+        if "lat" in p and "lon" in p:
+            series.append({"t": t, "lat": p["lat"], "lon": p["lon"]})
+        if "net_lat" in p and "net_lon" in p:
+            net_pts.append({"t": t, "lat": p["net_lat"], "lon": p["net_lon"],
+                            "acc": p.get("net_acc_m")})
+    return {"series": series, "net": net_pts}
 
 
 def faults_data(pack_id, rng):
@@ -525,7 +562,8 @@ def _handle(event, audit):
             data = cached(("track", pack_id, rng),
                           lambda: track_data(pack_id, rng))
             audit["decision"] = "allow"
-            return reply(200, {"pack_id": pack_id, "series": data})
+            return reply(200, {"pack_id": pack_id, "series": data["series"],
+                               "net": data["net"]})
 
         if kind == "faults":
             if FAULTS_GROUP not in groups:
