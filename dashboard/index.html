@@ -151,10 +151,11 @@
                     text-align: center; }
 
   /* ---- map ---- */
-  .map-card { margin-top: 1rem; background: var(--surface);
+  /* isolation: Leaflet's own z-indexes stay inside the card, under the header */
+  .map-card { margin-top: 1rem; background: var(--surface); isolation: isolate;
               border: 1px solid var(--hairline); border-radius: var(--radius);
               overflow: hidden; }
-  .map-card .head { display: flex; align-items: baseline; gap: .6rem;
+  .map-card .head { display: flex; flex-wrap: wrap; align-items: baseline; gap: .4rem .6rem;
                     padding: .9rem 1rem .6rem; }
   .map-card .head .label { font-size: .75rem; text-transform: uppercase;
                            letter-spacing: .08em; color: var(--ink-2); flex: 1; }
@@ -182,6 +183,27 @@
      so the three read as small multiples ---- */
   .fleet { display: grid; grid-template-columns: repeat(auto-fit, minmax(290px, 1fr));
            gap: 1rem; }
+  @media (min-width: 960px) {             /* a card keeps its width whatever the count */
+    .fleet { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  }
+  /* the fleet uses the screen: full width (to a cap), the cards across the
+     top, and the map takes whatever height the window has left below them */
+  body[data-view="fleet"] main, body[data-view="fleet"] footer { max-width: 2400px; }
+  #fleetView { display: flex; flex-direction: column;
+               min-height: calc(100vh - var(--hdr, 72px) - 3rem); }
+  .fleet-wrap { flex: 1; display: flex; flex-direction: column; gap: 1rem; }
+  #fleetMapCard { flex: 1; display: flex; flex-direction: column; margin-top: 0; }
+  /* where little height is left (laptop, phone) the map still gets half the window */
+  #fleetMapCard #fleetMap { flex: 1; min-height: max(360px, 50vh); }
+  /* a wide card (a big screen) puts the numbers left of the fact rows, so it
+     stays short and the map gets the height */
+  .pcard { container-type: inline-size; }
+  @container (min-width: 560px) {
+    .pcard .body { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr);
+                   column-gap: 1.4rem; align-items: start; }
+    .pcard .facts { margin-top: .5rem; padding: 0 0 0 1.2rem; border-top: 0;
+                    border-left: 1px solid var(--grid); }
+  }
   .pcard { background: var(--surface); border: 1px solid var(--hairline);
            border-radius: var(--radius); padding: .9rem 1rem 1rem;
            display: flex; flex-direction: column; min-width: 0; }
@@ -228,7 +250,17 @@
   .openbtn:hover { border-color: var(--red); color: var(--red-dk); }
   .fleet-none { color: var(--muted); padding: 2rem 0; }
   #histNone { font-size: .9rem; margin: .2rem 0 1rem; }
-  #fleetMap { height: 360px; }
+  /* a map expanded to the whole window (button in its header; Esc closes) */
+  .mapbtn { font: 500 .78rem Roboto, Arial, sans-serif; color: var(--ink-2);
+            background: var(--surface); border: 1px solid var(--hairline);
+            border-radius: 999px; padding: .25rem .75rem; cursor: pointer; white-space: nowrap; }
+  .mapbtn:hover { color: var(--red-dk); border-color: var(--red); }
+  .map-card.expanded, #fleetMapCard.expanded {   /* id: beats the #fleetMapCard layout rule */
+                       position: fixed; inset: 0; z-index: 1500; margin: 0; border: 0;
+                       border-radius: 0; display: flex; flex-direction: column;
+                       height: auto; min-height: 0; }
+  .map-card.expanded #map, .map-card.expanded #fleetMap { flex: 1; height: auto; min-height: 0; }
+  body.map-open { overflow: hidden; }
   .leaflet-tooltip.fleet-label { font: 500 .78rem Roboto, Arial, sans-serif; color: var(--ink);
                                  border-color: var(--hairline); box-shadow: none;
                                  padding: .1rem .4rem; }
@@ -368,17 +400,20 @@
       <h2>Fleet</h2>
       <span class="updated">choose up to three packs · open one for all its data</span>
     </div>
-    <section class="fleet" id="fleet"></section>
     <div class="fleet-none" id="fleetNone" hidden>No packs on this account have reported in the last 30 days.</div>
-    <div class="map-card" id="fleetMapCard">
-      <div class="head">
-        <span class="label">Pack locations</span>
-        <span class="maplegend">
-          <span><i class="gnss"></i>GNSS fix</span>
-          <span><i class="net"></i>Network (WiFi / cell) ± accuracy</span>
-        </span>
+    <div class="fleet-wrap">
+      <section class="fleet" id="fleet"></section>
+      <div class="map-card" id="fleetMapCard">
+        <div class="head">
+          <span class="label">Pack locations</span>
+          <span class="maplegend">
+            <span><i class="gnss"></i>GNSS fix</span>
+            <span><i class="net"></i>Network (WiFi / cell) ± accuracy</span>
+          </span>
+          <button type="button" class="mapbtn" aria-pressed="false">⤢ Full screen</button>
+        </div>
+        <div id="fleetMap"></div>
       </div>
-      <div id="fleetMap"></div>
     </div>
   </section>
 
@@ -423,6 +458,7 @@
         <span id="lgNet" hidden><i class="net"></i>Network (WiFi / cell) ± accuracy</span>
       </span>
       <span class="coords" id="coords">–</span>
+      <button type="button" class="mapbtn" aria-pressed="false">⤢ Full screen</button>
     </div>
     <div id="map"></div>
   </div>
@@ -1734,13 +1770,14 @@ function makeSlot(i) {
   e.when = mk("div", "when", e.card);
   e.nodata = mk("div", "nodata", e.card);
   e.body = mk("div", "body", e.card);
-  const socrow = mk("div", "socrow", e.body);
+  const left = mk("div", "left", e.body);   // SoC, meter, trend: left of the facts when wide
+  const socrow = mk("div", "socrow", left);
   const soc = mk("div", "soc", socrow);
   e.soc = mk("span", "", soc);
   mk("span", "unit", soc).textContent = "%";
   e.flow = mk("div", "flow", socrow);
-  e.meter = mk("i", "", mk("div", "meter", e.body));
-  s.spark = new SparkLine(mk("div", "spark", e.body));
+  e.meter = mk("i", "", mk("div", "meter", left));
+  s.spark = new SparkLine(mk("div", "spark", left));
   e.facts = mk("dl", "facts", e.body);
   const foot = mk("div", "foot", e.card);
   e.open = mk("button", "btnish openbtn", foot);
@@ -1987,10 +2024,37 @@ async function refreshFleet() {
   }
 }
 
+/* --- maps: full-window toggle (button in the card's header, Esc closes) --- */
+const mapToggles = [];
+function makeExpandable(card, lmap) {
+  const btn = card.querySelector(".mapbtn");
+  const set = on => {
+    if (card.classList.contains("expanded") === on) return;
+    card.classList.toggle("expanded", on);
+    document.body.classList.toggle("map-open", on);
+    btn.textContent = on ? "✕ Close" : "⤢ Full screen";
+    btn.setAttribute("aria-pressed", String(on));
+    setTimeout(() => lmap.invalidateSize(), 0);   // Leaflet re-measures, keeps its centre
+  };
+  btn.addEventListener("click", () => set(!card.classList.contains("expanded")));
+  mapToggles.push(set);
+}
+makeExpandable($("fleetMapCard"), fleetMap);
+makeExpandable($("packMapCard"), map);
+const collapseMaps = () => mapToggles.forEach(set => set(false));
+document.addEventListener("keydown", e => { if (e.key === "Escape") collapseMaps(); });
+// the fleet fills the window below the header, whatever the header's height
+new ResizeObserver(([e]) => document.documentElement.style.setProperty(
+  "--hdr", `${Math.round(e.target.getBoundingClientRect().height)}px`))
+  .observe(document.querySelector("header"));
+// the fleet map's size follows the layout (one column / two, window height)
+new ResizeObserver(() => fleetMap.invalidateSize()).observe($("fleetMap"));
+
 /* -------------------------------- routing -------------------------------- */
 function openPack(pid) { location.hash = `#pack/${encodeURIComponent(pid)}`; }
 
 function showView(v, fetch = true) {
+  collapseMaps();
   if (v !== view) window.scrollTo(0, 0);
   view = v;
   document.body.dataset.view = v;
