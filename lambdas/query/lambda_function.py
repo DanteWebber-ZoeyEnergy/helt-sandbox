@@ -99,7 +99,10 @@ FIELD_GROUPS = {
                  "inv_filter_inductor_c", "inv_ntc1_c", "inv_control_circuitry_c",
                  "inv_rectifier_diode_hs_c", "inv_igbt1_c", "inv_ntc5_c",
                  "inv_dcdc_fet_hs_c", "inv_ac_charger_hs_c",
-                 "mppt_solar_temp_c", "mppt_ac_temp_c"},
+                 "mppt_solar_temp_c", "mppt_ac_temp_c",
+                 # per-cell block (2026-10-01), one sample per 5 min
+                 *(f"cell{i}_mv" for i in range(1, 15)),
+                 *(f"cell_temp{i}_c" for i in range(1, 6))},
 }
 ALL_FIELDS = set().union(*FIELD_GROUPS.values())
 

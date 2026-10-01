@@ -51,6 +51,8 @@ UINT_FIELDS = (
     "ac_surge_count", "ac_surge_max_w", "fault_count",
     # network position (Phase L2/L3)
     "net_acc_m", "net_src", "net_age_s",
+    # per-cell block, every 5 min: cell1_mv .. cell14_mv
+    *(f"cell{i}_mv" for i in range(1, 15)),
 )
 FLOAT_FIELDS = (
     "pack_voltage_v", "current_a", "max_cell_temp_c",
@@ -61,6 +63,8 @@ FLOAT_FIELDS = (
     "inv_rectifier_diode_hs_c", "inv_igbt1_c", "inv_ntc5_c",
     "inv_dcdc_fet_hs_c", "inv_ac_charger_hs_c",
     "mppt_solar_temp_c", "mppt_ac_temp_c",
+    # per-cell block: cell_temp1_c .. cell_temp5_c
+    *(f"cell_temp{i}_c" for i in range(1, 6)),
 )
 INT_FIELDS = (
     "power_w",            # firmware v1, signed

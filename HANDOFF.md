@@ -104,7 +104,18 @@ sample without a usable GNSS fix may carry the network position `net_lat`,
 `net_lon`, `net_acc_m`, `net_src`, `net_age_s` (behind the firmware switch
 `GEOLOC_LOOKUP_ENABLE`). All follow the absent-key rule.
 
-Other payloads: `v1.cells` (per-cell mV, off by default), status on connect
+**Per-cell block (2026-10-01, `CLOUD_SYNC_DESIGN.md` "Per-cell block"):** one
+sample per 5 min, and the sample of every MQTT connect, also carries
+`cell1_mv` .. `cell14_mv` (uint, mV) and `cell_temp1_c` .. `cell_temp5_c`
+(float, °C, 1 dp). Each group all there or all absent. Listed in the ingest
+Lambda (union lists) and the query Lambda's `ops` group. The dashboard derives
+the rest client-side (`cellStats()`, a moment counts only with all 14 cells):
+"Cell voltages · latest reading" (one dot per cell, lowest / highest
+labelled), "Cell imbalance · highest − lowest" (`cell_spread_mv`), "Lowest /
+highest cell" (which cell in legend + tooltip) and "Cell temperatures".
+
+Other payloads: `v1.cells` (per-cell mV, off by default, not stored -- the
+ingest Lambda reads `schema: "v1"` only), status on connect
 (`online, pack_id, fw_version, uptime_s, si_state, ip`), command ACK
 (`{"ack":{"request_id","status","result"}}`), inbound command
 (`{"cmd_id","request_id","args"}`).
@@ -521,6 +532,18 @@ with its designed type. Record: firmware `LOCATION_DESIGN.md` §10-§11.
 Open: the pack's motion detection reads "moving" on the bench (10 s
 publishing over cellular), and the pre-SNTP `seq` anchor is wrong on
 cellular (§5 #7).
+
+**Done (2026-10-01): per-cell block (§3), cloud side.** Firmware `c1bd8e62`
+sends `cell1_mv`..`cell14_mv` + `cell_temp1_c`..`cell_temp5_c` on one sample
+per 5 min and on every connect sample. Deployed with the user's go-ahead: the
+shared ingest source to `helt-iot-influx` + `sandbox-ingest` and
+`sandbox-query` (`ops` group), all `Successful`; the live code of all three
+matched the committed sources first. Checked after: `history?field=cell7_mv`
+answers 200 (the field is known), HELT-0002's `latest` / `histories` unchanged,
+no ingest ERROR / WARN. Dashboard: the four cell cards (§3), previewed with
+sample data. Not yet seen with real data: HELT-0002 runs firmware without the
+block until it is flashed. `fake_pack.py` sends no cells, so the cards stay
+hidden for SANDBOX-* packs.
 
 **Next for the real pack:** the firmware repo's open issue on the internal-RAM
 budget with Wi-Fi up (instrument the boot, trim the Wi-Fi buffer pools, LVGL

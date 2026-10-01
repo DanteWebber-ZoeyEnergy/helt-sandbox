@@ -132,9 +132,11 @@
             gap: .1rem .9rem; margin-top: .3rem; font-size: .78rem; color: var(--ink-2); }
   .legend .item { display: flex; align-items: center; gap: .4rem; min-width: 0; }
   .legend .item[hidden] { display: none; }
+  .legend.rows { grid-template-columns: 1fr; }   /* long values (cell mV · cell N) */
   .legend .key { width: 14px; height: 3px; border-radius: 2px; flex: none; }
   .legend .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .legend .val { color: var(--ink); font-weight: 500; font-variant-numeric: tabular-nums; }
+  .card .caption { margin-top: .3rem; font-size: .78rem; color: var(--muted); }
 
   /* ---- faults list (firmware interval summary, 'ops' only) ---- */
   .faults { list-style: none; margin: .2rem 0 .2rem; padding: 0; max-height: 196px;
@@ -466,10 +468,28 @@ const FIELDS = [
   // surges: each dot is a window with a surge (peak W); not a trend line
   { key: "ac_surge_max_w",         label: "AC output surges · peak", unit: "W", dec: 0,
     dots: true, countKey: "ac_surge_count" },
+  // real packs, per-cell block (one sample per 5 min): derived here from
+  // cell1_mv .. cell14_mv, see cellStats()
+  { key: "cell_spread_mv",         label: "Cell imbalance · highest − lowest", unit: "mV",
+    dec: 0, derived: true },
 ];
 // Multi-series cards (same unit, one axis). A series keeps its slot color
 // whether or not the others have data -- color follows the entity.
 const MULTI = [
+  // per-cell block: the extremes of the 14 cells (derived, cellKey names the
+  // cell) -- 14 lines on one card would be unreadable -- and the 5 sensors
+  { id: "cell_minmax", label: "Lowest / highest cell", unit: "mV", dec: 0, rawTicks: true,
+    legendRows: true, series: [
+    { key: "cell_max_mv", label: "Highest cell", cellKey: "cell_max_idx" },
+    { key: "cell_min_mv", label: "Lowest cell",  cellKey: "cell_min_idx" },
+  ] },
+  { id: "cell_temps", label: "Cell temperatures", unit: "°C", dec: 1, series: [
+    { key: "cell_temp1_c", label: "Sensor 1" },
+    { key: "cell_temp2_c", label: "Sensor 2" },
+    { key: "cell_temp3_c", label: "Sensor 3" },
+    { key: "cell_temp4_c", label: "Sensor 4" },
+    { key: "cell_temp5_c", label: "Sensor 5" },
+  ] },
   { id: "inv_temps", label: "Inverter temperatures", unit: "°C", dec: 0, series: [
     { key: "inv_igbt1_c",              label: "IGBT 1" },
     { key: "inv_dcdc_fet_hs_c",        label: "DC-DC FET heatsink" },
@@ -487,6 +507,43 @@ const MULTI = [
 ];
 const SERIES_COLORS = ["--s1", "--s2", "--s3", "--s4", "--s5", "--s6", "--s7", "--s8"]
   .map(v => `var(${v})`);
+
+// Per-cell block (firmware, one sample per 5 min). A block is all 14 voltages
+// or none, so a moment with any cell missing is skipped, never half-ranked.
+const CELL_KEYS = Array.from({ length: 14 }, (_, i) => `cell${i + 1}_mv`);
+function cellStats(vals) {                 // vals[i] = cell i+1, mV, or null
+  let lo = null, hi = null, loC = 0, hiC = 0;
+  for (let i = 0; i < vals.length; i++) {
+    const v = vals[i];
+    if (v == null) return null;
+    if (lo == null || v < lo) { lo = v; loC = i + 1; }
+    if (hi == null || v > hi) { hi = v; hiC = i + 1; }
+  }
+  return { cell_min_mv: lo, cell_max_mv: hi, cell_spread_mv: hi - lo,
+           cell_min_idx: loC, cell_max_idx: hiC };
+}
+// /latest + the derived keys
+function withCells(t) {
+  const st = cellStats(CELL_KEYS.map(k => t[k] ?? null));
+  return st ? { ...t, ...st } : t;
+}
+// /histories + the derived series, one point per moment all 14 cells share
+// (the cells of one sample land in the same aggregate window)
+function withCellSeries(series) {
+  const by = CELL_KEYS.map(k => new Map((series[k] || []).map(p => [p.t, p.v])));
+  const out = { ...series, cell_min_mv: [], cell_max_mv: [], cell_spread_mv: [] };
+  for (const t of by[0].keys()) {
+    const st = cellStats(by.map(m => m.get(t) ?? null));
+    if (!st) continue;
+    out.cell_min_mv.push({ t, v: st.cell_min_mv, c: st.cell_min_idx });
+    out.cell_max_mv.push({ t, v: st.cell_max_mv, c: st.cell_max_idx });
+    out.cell_spread_mv.push({ t, v: st.cell_spread_mv });
+  }
+  for (const k of ["cell_min_mv", "cell_max_mv", "cell_spread_mv"]) {
+    if (!out[k].length) delete out[k];
+  }
+  return out;
+}
 // Pack state (CAN 0x100 bms_state, the system state the BMS owns).
 const STATE_NAMES = ["STORAGE", "SLEEP", "INIT", "STANDBY", "ACTIVE", "FAULT",
                      "FAIL", "STORAGE CONFIRM"];
@@ -682,7 +739,7 @@ class MultiLineChart {
     this.empty.style.display = "none";
     card.appendChild(this.empty);
     this.legend = document.createElement("div");
-    this.legend.className = "legend";
+    this.legend.className = spec.legendRows ? "legend rows" : "legend";
     for (const s of this.series) {
       const it = document.createElement("span");
       it.className = "item"; it.hidden = true;
@@ -714,7 +771,8 @@ class MultiLineChart {
     for (const s of this.series) {
       const v = t[s.key];
       this.now[s.key] = v == null ? null : v;
-      s.val.textContent = v == null ? "–" : `${fmt(v, this.spec.dec)} ${this.spec.unit}`;
+      s.val.textContent = v == null ? "–" : `${fmt(v, this.spec.dec)} ${this.spec.unit}` +
+        (s.cellKey && t[s.cellKey] != null ? ` · cell ${t[s.cellKey]}` : "");
     }
     this.syncLegend();
   }
@@ -759,7 +817,7 @@ class MultiLineChart {
                    stroke: "var(--grid)", "stroke-width": 1 });
       const t = el("text", { x: M.l - 7, y: Y(v) + 3.5, "text-anchor": "end",
                              "font-size": 10.5, fill: "var(--muted)" });
-      t.textContent = tickFmt(v);
+      t.textContent = tickFmt(v, this.spec.rawTicks);
     }
     for (const ts of timeTicks(x0, x1, 5)) {
       const t = el("text", { x: X(ts), y: H - 6, "text-anchor": "middle",
@@ -811,16 +869,17 @@ class MultiLineChart {
       if (best) {
         dot.setAttribute("cx", X(best.t)); dot.setAttribute("cy", Y(best.v));
         dot.setAttribute("opacity", 1);
-        rows.push({ s, v: best.v });
+        rows.push({ s, v: best.v, c: best.c });
       } else dot.setAttribute("opacity", 0);
     });
     rows.sort((a, b) => b.v - a.v);                 // hottest first
-    for (const { s, v } of rows) {
+    for (const { s, v, c } of rows) {
       const row = document.createElement("div");
       row.className = "tt-row";
       const k = document.createElement("i"); k.style.background = s.color;
       const txt = document.createElement("span");
-      txt.textContent = `${s.label}  ${fmt(v, this.spec.dec)} ${this.spec.unit}`;
+      txt.textContent = `${s.label}  ${fmt(v, this.spec.dec)} ${this.spec.unit}` +
+        (c != null ? ` · cell ${c}` : "");
       row.append(k, txt);
       this.tip.appendChild(row);
     }
@@ -836,6 +895,126 @@ class MultiLineChart {
 }
 const M_TOP_TIP = 150;   // multi-series tooltip: below the plot, clear of the lines
 
+/* --------- cell strip: the 14 cell voltages of one moment, as dots ---------
+   Position on a tight mV axis, not bar length, so a 10 mV imbalance between
+   3.3 V cells shows without a truncated bar axis. The axis never spans less
+   than CELL_MIN_SPAN_MV, so a well-balanced pack does not look ragged. The
+   lowest and highest cells carry their value as a direct label; hover names
+   any cell. One series: brand red, no legend -- the caption says when. */
+const CELL_MIN_SPAN_MV = 20;
+class CellStrip {
+  constructor(card) {
+    this.svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    card.appendChild(this.svg);
+    this.tip = document.createElement("div");
+    this.tip.className = "tooltip";
+    card.appendChild(this.tip);
+    this.caption = document.createElement("div");
+    this.caption.className = "caption";
+    card.appendChild(this.caption);
+    this.latest = null;                     // { vals, t } from /latest
+    this.recent = null;                     // the newest moment in the history range
+    this.svg.addEventListener("pointermove", e => this.hover(e));
+    this.svg.addEventListener("pointerleave", () => this.hover(null));
+    new ResizeObserver(() => this.draw()).observe(this.svg);
+  }
+
+  get cur() { return this.latest || this.recent; }
+  hasData() { return !!this.cur; }
+
+  setLatest(t, tts) {
+    const vals = CELL_KEYS.map(k => t[k] ?? null);
+    this.latest = cellStats(vals) ? { vals, t: tts ? tts[CELL_KEYS[0]] : null } : null;
+    this.draw();
+  }
+  setRecent(series) {
+    const last = (series.cell_spread_mv || []).at(-1);   // a moment all 14 share
+    if (!last) { this.recent = null; this.draw(); return; }
+    const vals = CELL_KEYS.map(k =>
+      ((series[k] || []).find(p => p.t === last.t) || {}).v ?? null);
+    this.recent = { vals, t: last.t };
+    this.draw();
+  }
+  clear() { this.latest = this.recent = null; this.draw(); }
+
+  draw() {
+    const W = this.svg.clientWidth || 340, H = 150;
+    const M = { l: 44, r: 12, t: 16, b: 22 };
+    this.svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+    this.svg.replaceChildren();
+    this.geom = null;
+    const cur = this.cur;
+    if (!cur) { this.caption.textContent = ""; return; }
+    const st = cellStats(cur.vals);
+    let lo = st.cell_min_mv, hi = st.cell_max_mv;
+    if (hi - lo < CELL_MIN_SPAN_MV) {
+      const mid = (hi + lo) / 2;
+      lo = mid - CELL_MIN_SPAN_MV / 2; hi = mid + CELL_MIN_SPAN_MV / 2;
+    }
+    const pad = (hi - lo) * 0.18; lo -= pad; hi += pad;
+    const band = (W - M.l - M.r) / cur.vals.length;
+    const X = i => M.l + (i + 0.5) * band;
+    const Y = v => H - M.b - (v - lo) / (hi - lo) * (H - M.t - M.b);
+    this.geom = { X, Y, band };
+
+    const NS = this.svg.namespaceURI;
+    const el = (n, at) => { const e = document.createElementNS(NS, n);
+      for (const k in at) e.setAttribute(k, at[k]); this.svg.appendChild(e); return e; };
+    for (const v of niceTicks(lo, hi, 4)) {
+      if (v < lo || v > hi) continue;
+      el("line", { x1: M.l, x2: W - M.r, y1: Y(v), y2: Y(v),
+                   stroke: "var(--grid)", "stroke-width": 1 });
+      const t = el("text", { x: M.l - 7, y: Y(v) + 3.5, "text-anchor": "end",
+                             "font-size": 10.5, fill: "var(--muted)" });
+      t.textContent = tickFmt(v, true);
+    }
+    cur.vals.forEach((v, i) => {
+      const t = el("text", { x: X(i), y: H - 6, "text-anchor": "middle",
+                             "font-size": 10.5, fill: "var(--muted)" });
+      t.textContent = i + 1;
+      el("circle", { cx: X(i), cy: Y(v), r: 4, fill: "var(--red)",
+                     stroke: "var(--surface)", "stroke-width": 2 });
+    });
+    // direct labels: highest above its dot, lowest below (text in ink)
+    const lab = (i, dy) => {
+      const t = el("text", { x: X(i), y: Y(cur.vals[i]) + dy, "text-anchor": "middle",
+                             "font-size": 10.5, "font-weight": 500, fill: "var(--ink-2)" });
+      t.textContent = fmt(cur.vals[i], 0);
+    };
+    if (st.cell_spread_mv > 0) { lab(st.cell_max_idx - 1, -9); lab(st.cell_min_idx - 1, 17); }
+    else lab(0, -9);
+    this.cross = el("line", { x1: 0, x2: 0, y1: M.t, y2: H - M.b,
+                              stroke: "var(--hairline)", "stroke-width": 1, opacity: 0 });
+    this.svg.insertBefore(this.cross, this.svg.firstChild);
+    this.caption.textContent = (cur.t ? `Reading at ${new Date(cur.t * 1000).toLocaleString([],
+      { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })} · ` : "") +
+      `lowest cell ${st.cell_min_idx}, highest cell ${st.cell_max_idx}`;
+  }
+
+  hover(e) {
+    const cur = this.cur;
+    if (!e || !this.geom || !cur) {
+      if (this.cross) this.cross.setAttribute("opacity", 0);
+      this.tip.style.opacity = 0;
+      return;
+    }
+    const { X, Y, band } = this.geom;
+    const r = this.svg.getBoundingClientRect();
+    const i = Math.max(0, Math.min(cur.vals.length - 1,
+      Math.floor((e.clientX - r.left - X(0) + band / 2) / band)));
+    const px = X(i), py = Y(cur.vals[i]);
+    this.cross.setAttribute("x1", px); this.cross.setAttribute("x2", px);
+    this.cross.setAttribute("opacity", 1);
+    this.tip.replaceChildren();
+    const b = document.createElement("b");
+    b.textContent = `Cell ${i + 1} · ${fmt(cur.vals[i], 0)} mV`;
+    this.tip.append(b);
+    this.tip.style.left = `${px}px`;
+    this.tip.style.top = `${py + 28}px`;
+    this.tip.style.opacity = 1;
+  }
+}
+
 function niceTicks(lo, hi, n) {
   const span = hi - lo, raw = span / n;
   const mag = Math.pow(10, Math.floor(Math.log10(raw)));
@@ -844,7 +1023,9 @@ function niceTicks(lo, hi, n) {
   for (let v = Math.ceil(lo / step) * step; v <= hi + 1e-9; v += step) out.push(v);
   return out;
 }
-const tickFmt = v => Math.abs(v) >= 1000 ? (v / 1000).toFixed(1).replace(/\.0$/, "") + "k"
+// raw: every digit (cell mV -- "3.3k" would merge 3310 and 3320)
+const tickFmt = (v, raw) => !raw && Math.abs(v) >= 1000
+                   ? (v / 1000).toFixed(1).replace(/\.0$/, "") + "k"
                    : +v.toFixed(2) + "";
 function timeTicks(x0, x1, n) {
   const out = [], step = (x1 - x0) / (n - 1);
@@ -877,6 +1058,7 @@ function makeCard(id, labelText) {
   return card;
 }
 for (const f of FIELDS) charts[f.key] = new LineChart(makeCard(f.key, f.label), f);
+const cellStrip = new CellStrip(makeCard("cells_now", "Cell voltages · latest reading"));
 for (const m of MULTI) multis[m.id] = new MultiLineChart(makeCard(m.id, m.label), m);
 
 // Faults ('ops' only): the pack's faults in the range, newest first.
@@ -895,6 +1077,7 @@ function syncCards() {
     cards[f.key].hidden = !(charts[f.key].data.length || latestT[f.key] != null);
   }
   for (const m of MULTI) cards[m.id].hidden = !multis[m.id].hasData();
+  cards.cells_now.hidden = !cellStrip.hasData();
 }
 
 for (const r of RANGES) {
@@ -962,7 +1145,7 @@ async function pollLatest() {
   if (!auth) return;
   try {
     const d = await getJSON(`/packs/${PACK}/latest`);
-    const t = d.telemetry || {};
+    const t = withCells(d.telemetry || {});
     $("pid").textContent = d.pack_id || PACK;
     lastUpdatedTs = d.updated_ts || null;
     renderAge();
@@ -998,6 +1181,7 @@ async function pollLatest() {
       n.appendChild(u);
     }
     for (const m of MULTI) multis[m.id].setNow(t);
+    cellStrip.setLatest(t, tts);
     syncCards();
     renderPosition(t, tts, d.updated_ts);
     setErr("latest", "");
@@ -1051,6 +1235,8 @@ function renderPosition(t, tts, updated) {
 let bundledApi = true;   // flips off if the deployed Lambda predates /histories
 
 function applyBundle(series) {
+  series = withCellSeries(series);
+  cellStrip.setRecent(series);
   for (const f of FIELDS) {
     let pts = series[f.key] || [];
     if (f.countKey) {                       // surges: attach the window's count
@@ -1153,7 +1339,7 @@ async function refreshHistory() {
     // legacy path (pre-/histories Lambda): one call per field + track.
     // on a failed fetch: keep the previous render (never fake "no data"),
     // report the field in the error strip, and let the next refresh retry
-    const jobs = FIELDS.map(f => () =>
+    const jobs = FIELDS.filter(f => !f.derived).map(f => () =>
       getJSON(`/packs/${PACK}/history?field=${f.key}&range=${range}`)
         .then(h => charts[f.key].draw(h.series || []))
         .catch(e => { failed.push(f.key); console.warn(`history ${f.key}:`, e); }));
@@ -1198,6 +1384,7 @@ $("packSel").addEventListener("change", () => {
   localStorage.setItem("helt_pack", PACK);
   for (const f of FIELDS) charts[f.key].draw([]);   // new context — clear, don't blend
   for (const m of MULTI) { multis[m.id].setNow({}); multis[m.id].draw({}); }
+  cellStrip.clear();
   latestT = {};
   syncCards();
   faultsAllowed = true;                             // entitlement is per pack
