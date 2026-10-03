@@ -592,6 +592,28 @@ path uses the same `/track` (its own range, re-read every 2 min, the chart
 data's coarser path until it answers), simplification, dotted gaps and
 arrowheads (red); network positions stay faint circles.
 
+**Done (2026-10-03): parked-position filter (dashboard only).** A parked
+pack's GNSS wanders 15-35 m typically and 130-300 m at worst (indoors), and
+the stream alternates with the network position (~50 m off), so every night
+drew a tangle of path. `index.html`'s `<position-filter>` block (pure
+functions) finds stays -- readings within 250 m for 10 min; leaving takes
+5 min outside; consecutive stays within 150 m merge -- and places each at
+the densest cluster of its GNSS fixes (mean shift, 15 m), or its network
+position with < 10 fixes. Both maps draw a stay as one spot (a ring if it is
+an earlier one) and show the current marker at the stay while parked; a
+"Filter parked positions" switch (one setting, localStorage
+`helt_posfilter`) shows every reading instead. Hovering a path names the
+reading under the cursor (time to the second, GNSS / network) or the stay
+(from - to, duration, fix count). Checked against ground truth the user gave
+for the night of 2026-10-01: the shown position 4 m (HELT-0002) / 7 m
+(HELT-0003) from where the packs stood (raw 10 / 22 m typical, 74 / 275 m
+worst), 0 km of overnight path (raw 0.3 / 11.4 km), the 70 km morning trip
+kept; HELT-0001 had no GNSS that night (its WiFi position, 46 m off, is the
+floor). Cost: no API change; ~6-13 ms per pack per new /track answer in the
+browser, ~6 ms per fleet redraw (raw mode ~50 ms: ~9,000 dots). Moves under
+250 m do not show while filtering. HELT-0002's GNSS sat ~20 m west of 0001 /
+0003 on 2026-10-02 (packs together) -- unexplained.
+
 **Next for the real pack:** the firmware repo's open issue on the internal-RAM
 budget with Wi-Fi up (instrument the boot, trim the Wi-Fi buffer pools, LVGL
 allocation audit) is the one thing 7C surfaced that is not fixed -- it is a

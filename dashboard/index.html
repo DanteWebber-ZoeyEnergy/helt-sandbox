@@ -179,6 +179,19 @@
   .maplegend i.trail { width: 16px; height: 3px; border-radius: 2px; background: var(--ink);
                        vertical-align: 2px; }
   .maplegend i.trail.gnss { background: var(--red); }
+  .maplegend i.parked { background: var(--surface); box-shadow: inset 0 0 0 2px var(--ink); }
+  .maplegend i.parked.gnss { box-shadow: inset 0 0 0 2px var(--red); }
+  /* filter on / off for both maps (one setting) */
+  .mapswitch { display: inline-flex; align-items: center; gap: .4rem; font-size: .78rem;
+               color: var(--ink-2); cursor: pointer; user-select: none; white-space: nowrap; }
+  .mapswitch input { appearance: none; -webkit-appearance: none; width: 28px; height: 16px;
+                     margin: 0; border-radius: 999px; background: rgba(51,62,72,.3);
+                     position: relative; cursor: pointer; transition: background .15s; flex: none; }
+  .mapswitch input::after { content: ""; position: absolute; top: 2px; left: 2px; width: 12px;
+                            height: 12px; border-radius: 50%; background: #fff; transition: transform .15s; }
+  .mapswitch input:checked { background: var(--red); }
+  .mapswitch input:checked::after { transform: translateX(12px); }
+  .mapswitch input:focus-visible { outline: 2px solid var(--red); outline-offset: 2px; }
   /* fleet trails: a small arrowhead every ~70 px of path, pointing the way the
      pack went; ink with a surface edge so it reads on any map tile */
   .trail-arrow { display: block; width: 10px; height: 10px; overflow: visible; }
@@ -420,8 +433,11 @@
           <span class="maplegend">
             <span><i class="gnss"></i>GNSS fix</span>
             <span><i class="net"></i>Network (WiFi / cell) ± accuracy</span>
-            <span id="lgTrail" hidden><i class="trail"></i>Path, last 24 h (arrows: direction; dotted: no readings)</span>
+            <span id="lgTrail" hidden><i class="trail"></i>Path, last 24 h (arrows: direction; dotted: no readings; hover: time)</span>
+            <span id="lgParked" hidden><i class="parked"></i>Parked earlier</span>
           </span>
+          <label class="mapswitch" title="On: a parked pack shows as one spot, its most likely position. Off: every position reading as it came in.">
+            <input type="checkbox" class="posfilter" checked><span>Filter parked positions</span></label>
           <button type="button" class="mapbtn" aria-pressed="false">⤢ Full screen</button>
         </div>
         <div id="fleetMap"></div>
@@ -468,9 +484,12 @@
       <span class="maplegend">
         <span id="lgGnss" hidden><i class="gnss"></i>GNSS</span>
         <span id="lgNet" hidden><i class="net"></i>Network (WiFi / cell) ± accuracy</span>
-        <span id="lgPath" hidden><i class="trail gnss"></i>GNSS path (arrows: direction; dotted: no readings)</span>
+        <span id="lgPath" hidden><i class="trail gnss"></i>Path (arrows: direction; dotted: no readings; hover: time)</span>
+        <span id="lgPackParked" hidden><i class="parked gnss"></i>Parked earlier</span>
       </span>
       <span class="coords" id="coords">–</span>
+      <label class="mapswitch" title="On: a parked pack shows as one spot, its most likely position. Off: every position reading as it came in.">
+        <input type="checkbox" class="posfilter" checked><span>Filter parked positions</span></label>
       <button type="button" class="mapbtn" aria-pressed="false">⤢ Full screen</button>
     </div>
     <div id="map"></div>
@@ -1292,27 +1311,220 @@ function fitRangeTo(pid) {
 }
 
 /* ------------------------- map paths (both maps) -------------------------- */
-const TRAIL_MIN_M = 25;                   // GNSS wander below this is not movement
 const TRAIL_GAP_S = 30 * 60;              // no reading for this long: route unknown
 const ARROW_EVERY_PX = 70;                // one arrowhead per this much path on screen
 const INK = "#333e48";                    // --ink (Leaflet styles take no CSS vars)
+const NET_BLUE = "#2a78d6";               // --s1, the network position's hue
 
-// pts oldest first, each {t, lat, lon, acc}. A point closer to the last kept
-// one than either's uncertainty (GNSS: TRAIL_MIN_M, network: its accuracy) is
-// the same place, so a parked pack draws no path; `tEnd` keeps how long it
-// stayed there, so a later gap means no readings, not a long stop.
-function simplifyPath(pts) {
-  const kept = [];
-  for (const p of pts) {
-    const prev = kept.at(-1);
-    if (prev && L.latLng(prev.lat, prev.lon).distanceTo([p.lat, p.lon]) <
-                Math.max(TRAIL_MIN_M, prev.acc || 0, p.acc || 0)) {
-      prev.tEnd = p.t;
+/* <position-filter> -- pure functions (no DOM, no Leaflet), so the same code
+   is checked offline against ground truth: on the night of 2026-10-01 the
+   parked positions came out 4 m (HELT-0002) and 7 m (HELT-0003) from where
+   the packs stood, against 10-22 m typical / 275 m worst for single readings,
+   and none of the 11 km of overnight wander was drawn. Parked detection:
+   readings within R_M of a spot for MIN_S = parked there; leaving takes
+   LEAVE_S outside R_M (a jump that comes back is wander); two consecutive
+   stays within MERGE_M are one (what lay between was wander). A stay's
+   position is the densest cluster of its GNSS fixes (a stray fix moves it
+   nowhere); with fewer than MIN_GNSS fixes, its network (WiFi / cell)
+   position. Moves shorter than R_M do not show while filtering is on. */
+const PARK = { R_M: 250, MIN_S: 600, LEAVE_S: 300, MERGE_M: 150, MERGE_GAP_S: 3600,
+               BW_M: 15, MIN_GNSS: 10, MAX_FIT_PTS: 1500 };
+const M_PER_DEG = 111320;
+function distM(a, b) {                          // haversine, {lat, lon} in degrees
+  const r = Math.PI / 180, la1 = a.lat * r, la2 = b.lat * r;
+  const h = Math.sin((la2 - la1) / 2) ** 2 +
+            Math.cos(la1) * Math.cos(la2) * Math.sin((b.lon - a.lon) * r / 2) ** 2;
+  return 2 * 6371000 * Math.asin(Math.sqrt(h));
+}
+// One time-ordered stream: the GNSS fix where the pack had one, else its
+// network position. track = /track's {series: [{t,lat,lon}], net: [{t,lat,lon,acc}]}
+function readingsFrom(track) {
+  const out = (track?.series || []).map(p => ({ t: p.t, lat: p.lat, lon: p.lon, acc: 0, src: "g" }));
+  const g = new Set(out.map(p => p.t));
+  for (const p of track?.net || []) {
+    if (!g.has(p.t)) out.push({ t: p.t, lat: p.lat, lon: p.lon, acc: p.acc || 0, src: "n" });
+  }
+  return out.sort((a, b) => a.t - b.t);
+}
+function medianOf(xs) {
+  const s = xs.slice().sort((a, b) => a - b), m = s.length >> 1;
+  return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+}
+function medianLL(pts) { return { lat: medianOf(pts.map(p => p.lat)), lon: medianOf(pts.map(p => p.lon)) }; }
+// the densest spot: start at the geometric median, then step to the
+// Gaussian-weighted mean of the fixes around it (BW_M wide) until it settles.
+// Long stays are thinned evenly to MAX_FIT_PTS fixes (same answer, bounded cost).
+function densestSpot(pts) {
+  const step = Math.max(1, Math.ceil(pts.length / PARK.MAX_FIT_PTS));
+  const P = pts.filter((_, i) => i % step === 0);
+  const o = medianLL(P), kx = M_PER_DEG * Math.cos(o.lat * Math.PI / 180);
+  const X = P.map(p => [(p.lon - o.lon) * kx, (p.lat - o.lat) * M_PER_DEG]);
+  let y = [0, 0];
+  for (let it = 0; it < 200; it++) {            // Weiszfeld
+    let nx = 0, ny = 0, den = 0;
+    for (const [a, b] of X) {
+      const d = Math.hypot(a - y[0], b - y[1]) || 1e-6;
+      nx += a / d; ny += b / d; den += 1 / d;
+    }
+    const ny2 = [nx / den, ny / den], moved = Math.hypot(ny2[0] - y[0], ny2[1] - y[1]);
+    y = ny2;
+    if (moved < 0.01) break;
+  }
+  const bw2 = 2 * PARK.BW_M * PARK.BW_M;
+  for (let it = 0; it < 100; it++) {            // mean shift
+    let sx = 0, sy = 0, sw = 0;
+    for (const [a, b] of X) {
+      const w = Math.exp(-((a - y[0]) ** 2 + (b - y[1]) ** 2) / bw2);
+      sx += w * a; sy += w * b; sw += w;
+    }
+    if (sw < 1e-12) break;
+    const ny2 = [sx / sw, sy / sw], moved = Math.hypot(ny2[0] - y[0], ny2[1] - y[1]);
+    y = ny2;
+    if (moved < 0.01) break;
+  }
+  return { lat: o.lat + y[1] / M_PER_DEG, lon: o.lon + y[0] / kx };
+}
+function stayPosition(rd, i0, i1) {
+  const g = [], n = [];
+  for (let i = i0; i <= i1; i++) (rd[i].src === "g" ? g : n).push(rd[i]);
+  if (g.length >= PARK.MIN_GNSS) return { ...densestSpot(g), src: "g", n: g.length };
+  if (n.length) return { ...medianLL(n), src: "n", n: n.length, acc: medianOf(n.map(p => p.acc)) };
+  return { ...medianLL(g), src: "g", n: g.length };
+}
+// Stays as index ranges [i0, i1] of rd (contiguous); readings outside every
+// stay are movement. The running centre (median of the GNSS fixes so far) is
+// recomputed as the stay grows by 10 %, keeping this ~linear in readings.
+function findStays(rd) {
+  const stays = [];
+  if (!rd.length) return stays;
+  let i0 = 0, i1 = 0, out0 = -1, cache = null;
+  const centre = () => {
+    const n = i1 - i0 + 1;
+    if (!cache || cache.i0 !== i0 || n >= cache.n * 1.1 + 5) {
+      const seg = rd.slice(i0, i1 + 1), g = seg.filter(p => p.src === "g");
+      cache = { i0, n, c: medianLL(g.length ? g : seg) };
+    }
+    return cache.c;
+  };
+  const flush = (a, b) => { if (rd[b].t - rd[a].t >= PARK.MIN_S) stays.push({ i0: a, i1: b }); };
+  for (let i = 1; i < rd.length; i++) {
+    if (distM(centre(), rd[i]) <= PARK.R_M) { i1 = i; out0 = -1; continue; }
+    if (out0 < 0) out0 = i;
+    if (rd[i].t - rd[out0].t >= PARK.LEAVE_S) {   // really left
+      flush(i0, out0 - 1);
+      i0 = out0; i1 = i; out0 = -1; cache = null;
+    }
+  }
+  flush(i0, rd.length - 1);
+  return stays;
+}
+// findStays + merging stays that turn out to be the same place, each with
+// its position: [{i0, i1, t0, t1, lat, lon, src, n, acc?}]
+function parkedStays(rd) {
+  const out = [];
+  for (const s of findStays(rd)) {
+    let st = { ...s, ...stayPosition(rd, s.i0, s.i1) };
+    const prev = out.at(-1);
+    if (prev && rd[st.i0].t - rd[prev.i1].t <= PARK.MERGE_GAP_S && distM(prev, st) <= PARK.MERGE_M) {
+      out.pop();
+      st = { i0: prev.i0, i1: st.i1, ...stayPosition(rd, prev.i0, st.i1) };
+    }
+    out.push(st);
+  }
+  for (const s of out) { s.t0 = rd[s.i0].t; s.t1 = rd[s.i1].t; }
+  return out;
+}
+// The path to draw: one vertex per stay (t .. tEnd = its span), every reading
+// between stays as it came. kind "stay" | "g" | "n".
+function filteredPath(rd, stays) {
+  const v = [];
+  let k = 0;
+  for (let i = 0; i < rd.length; i++) {
+    const s = stays[k];
+    if (s && i >= s.i0) {
+      v.push({ t: s.t0, tEnd: s.t1, lat: s.lat, lon: s.lon, kind: "stay", stay: s });
+      i = s.i1; k++;
       continue;
     }
-    kept.push({ ...p, tEnd: p.t });
+    v.push({ t: rd[i].t, tEnd: rd[i].t, lat: rd[i].lat, lon: rd[i].lon, kind: rd[i].src, acc: rd[i].acc });
   }
-  return kept.length >= 2 ? kept : null;
+  return v;
+}
+function rawPath(rd) {
+  return rd.map(p => ({ t: p.t, tEnd: p.t, lat: p.lat, lon: p.lon, kind: p.src, acc: p.acc }));
+}
+// Is the pack parked now? The last stay, if it runs to the newest reading and
+// `latest` (a newer position, or null) is still within R_M of it.
+function parkedNow(rd, stays, latest) {
+  const s = stays.at(-1);
+  if (!s || s.i1 !== rd.length - 1) return null;
+  if (latest && latest.t > s.t1 && distM(s, latest) > PARK.R_M) return null;
+  return s;
+}
+/* </position-filter> */
+
+
+// Filtering on (the default) or off (every reading as it came in): one
+// setting for both maps, kept per browser.
+let posFilter = (() => { try { return localStorage.getItem("helt_posfilter") !== "0"; }
+                         catch { return true; } })();
+// Analyse a /track answer once (parked stays), cached on `holder` per answer.
+function analyse(holder, track) {
+  if (holder.anTrack !== track) {
+    const rd = readingsFrom(track);
+    holder.anTrack = track;
+    holder.an = { rd, stays: parkedStays(rd) };
+  }
+  return holder.an;
+}
+function durText(sec) {
+  return sec < 3600 ? `${Math.max(1, Math.round(sec / 60))} min`
+       : sec < 48 * 3600 ? `${(sec / 3600).toFixed(1)} h` : `${(sec / 86400).toFixed(1)} d`;
+}
+// a reading's time to the second: "14:05:30" today, "Sep 30, 14:05:30" before
+function whenSecText(ts) {
+  const d = new Date(ts * 1000), opt = { hour: "2-digit", minute: "2-digit", second: "2-digit" };
+  return d.toDateString() === new Date().toDateString() ? d.toLocaleTimeString([], opt)
+    : d.toLocaleString([], { month: "short", day: "numeric", ...opt });
+}
+function parkedText(s) {
+  return (s.src === "g" ? `most likely spot from ${s.n} GNSS fixes`
+                        : `network position ± ${fmt(s.acc, 0)} m`);
+}
+function vertexText(p) {
+  if (p.kind === "stay") {
+    const s = p.stay;
+    const sameDay = new Date(s.t0 * 1000).toDateString() === new Date(s.t1 * 1000).toDateString();
+    const end = sameDay ? new Date(s.t1 * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+                        : whenText(s.t1);
+    return `parked ${whenText(s.t0)} – ${end} (${durText(s.t1 - s.t0)}) · ${parkedText(s)}`;
+  }
+  return `${whenSecText(p.t)} · ` + (p.kind === "g" ? "GNSS" : `network ± ${fmt(p.acc, 0)} m`);
+}
+// Hovering a drawn path names the reading under the cursor (a parked spot:
+// when, for how long, from what): `hit` is a wide invisible line over the
+// path; the nearest vertex on screen wins and `ring` marks it.
+function attachPathHover(lmap, hit, getVerts, label, ring, { onEnter, onLeave } = {}) {
+  let xy = null, key = null;
+  hit.bindTooltip("", { sticky: true, direction: "top", offset: [0, -10] });
+  hit.on("mouseover", () => onEnter && onEnter());
+  hit.on("mouseout", () => { ring.remove(); if (onLeave) onLeave(); });
+  hit.on("mousemove", e => {
+    const verts = getVerts();
+    if (!verts || !verts.length) return;
+    if (key?.verts !== verts || key.zoom !== lmap.getZoom()) {
+      key = { verts, zoom: lmap.getZoom() };
+      xy = verts.map(p => lmap.latLngToLayerPoint([p.lat, p.lon]));
+    }
+    let best = 0, bd = Infinity;
+    for (let i = 0; i < xy.length; i++) {
+      const d = xy[i].distanceTo(e.layerPoint);
+      if (d < bd) { bd = d; best = i; }
+    }
+    const p = verts[best];
+    ring.setLatLng([p.lat, p.lon]).addTo(lmap);
+    hit.setTooltipContent(label + vertexText(p));
+  });
 }
 
 // Solid while readings kept coming; dotted (a straight line, the real route
@@ -1364,33 +1576,64 @@ const map = L.map("map", { zoomControl: true, attributionControl: true });
 L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png",
   { maxZoom: 19, attribution: "&copy; OpenStreetMap contributors" }).addTo(map);
 map.setView([-33.9249, 18.4241], 13);
-// The GNSS path: solid, dotted across gaps in readings, red arrowheads for
-// the direction. From /track (15-s steps up to 24h, so a drive follows the
-// road) once it answers, else from the chart data (the range's coarser
-// windows). Network positions stay apart, as faint circles.
-const trail = L.polyline([], { color: "#c23c33", weight: 3, opacity: .8 }).addTo(map);
-const trailGap = L.polyline([], { color: "#c23c33", weight: 3, opacity: .8,
+// The path in the range: solid, dotted across gaps in readings, red
+// arrowheads for the direction, from /track (15-s steps up to 24h, so a drive
+// follows the road) once it answers, else from the chart data (the range's
+// coarser windows). Filtered (posFilter): GNSS + network readings as one
+// stream, each parked stay one spot (a ring, the current one under the
+// marker), network circles hidden. Raw: every GNSS reading as a dot on the
+// line, network positions apart as faint circles.
+const RED = "#c23c33";
+const trail = L.polyline([], { color: RED, weight: 3, opacity: .8, interactive: false }).addTo(map);
+const trailGap = L.polyline([], { color: RED, weight: 3, opacity: .8, interactive: false,
                                   dashArray: "1 7", lineCap: "round" }).addTo(map);
+const packMarks = L.layerGroup().addTo(map);           // raw dots / parked rings
+const packDots = L.canvas({ padding: 0.2 });           // thousands of dots: one canvas
+const packHit = L.polyline([], { color: RED, weight: 16, opacity: 0 }).addTo(map);
 map.createPane("trailArrows").style.zIndex = 450;   // above the path, under the marker
 const packArrows = L.layerGroup().addTo(map);
+const packRing = L.circleMarker([0, 0], { pane: "trailArrows", radius: 6, color: RED, weight: 2,
+                                          fillColor: "#fff", fillOpacity: .7, interactive: false });
 const PACK_TRACK_MS = 2 * 60 * 1000;      // the fine path is re-read every 2 min
-let histTrailPts = [];                    // the path from the chart data
+let histTrack = { series: [], net: [] };  // the positions in the chart data
 let packTrack = null, packTrackKey = "", packTrackAt = 0, packTrackOk = true;
-let packTrailPts = null;                  // the path as drawn (simplified)
+let packHolder = {};                      // analyse() cache for the shown pack
+let packPathV = null;                     // the path as drawn (vertices)
+let packLatest = null;                    // /latest: { t, tts, updated }
+attachPathHover(map, packHit, () => packPathV, "", packRing);
+function packTrackData() {
+  return packTrack && packTrackKey === `${PACK}|${range}` ? packTrack : histTrack;
+}
 function drawPackTrail() {
-  const fine = packTrack && packTrackKey === `${PACK}|${range}`;
-  const raw = fine ? (packTrack.series || []).map(p => ({ t: p.t, lat: p.lat, lon: p.lon, acc: 0 }))
-                   : histTrailPts;
-  packTrailPts = simplifyPath(raw);
-  const { solid, dotted } = packTrailPts ? splitRuns(packTrailPts) : { solid: [], dotted: [] };
+  const an = analyse(packHolder, packTrackData());
+  const v = posFilter ? filteredPath(an.rd, an.stays) : rawPath(an.rd.filter(p => p.src === "g"));
+  packPathV = v.length >= 2 ? v : null;
+  const { solid, dotted } = packPathV ? splitRuns(packPathV) : { solid: [], dotted: [] };
   trail.setLatLngs(solid);
   trailGap.setLatLngs(dotted);
-  $("lgPath").hidden = !packTrailPts;
+  packHit.setLatLngs([...solid, ...dotted]);
+  packMarks.clearLayers();
+  const now = posFilter ? parkedNowPack() : null;
+  let rings = 0;
+  for (const p of packPathV || []) {
+    if (!posFilter) {
+      L.circleMarker([p.lat, p.lon], { renderer: packDots, radius: 2, stroke: false, fillColor: RED,
+                                       fillOpacity: .8, interactive: false }).addTo(packMarks);
+    } else if (p.kind === "stay" && p.stay !== now) {
+      rings++;
+      L.circleMarker([p.lat, p.lon], { pane: "trailArrows", radius: 5, color: RED, weight: 2,
+                                       fillColor: "#fff", fillOpacity: 1, interactive: false }).addTo(packMarks);
+    }
+  }
+  if (posFilter) netTrail.remove(); else netTrail.addTo(map);
+  $("lgPath").hidden = !packPathV;
+  $("lgPackParked").hidden = !rings;
   drawPackArrows();
+  drawPackPosition();
 }
 function drawPackArrows() {
   packArrows.clearLayers();
-  if (packTrailPts) placeArrows(map, packArrows, packTrailPts, { cls: "gnss" });
+  if (packPathV) placeArrows(map, packArrows, packPathV, { cls: "gnss" });
 }
 map.on("moveend", drawPackArrows);
 async function loadPackTrack() {
@@ -1501,6 +1744,38 @@ async function pollLatest() {
 // with the newest sample: the firmware drops net_* once the GNSS has a usable
 // fix (and lat/lon while it has none), so an older one is history, not "now".
 function renderPosition(t, tts, updated) {
+  packLatest = { t, tts, updated };
+  drawPackPosition();
+}
+// Filtering on and the pack parked: its stay's position, not the newest
+// (wandering) reading -- unless /latest has it more than R_M away (it left).
+function parkedNowPack() {
+  const an = packHolder.an;
+  if (!posFilter || !an) return null;
+  const l = packLatest && packPosition(packLatest.t, packLatest.tts || {}, packLatest.updated);
+  return parkedNow(an.rd, an.stays, l && l.t ? { lat: l.lat, lon: l.lon, t: l.t } : null);
+}
+function drawPackPosition() {
+  if (!packLatest) return;
+  const { t, tts, updated } = packLatest;
+  const st = parkedNowPack();
+  if (st) {
+    setMapVisible(true);
+    const g = st.src === "g";
+    $("lgGnss").hidden = !g;
+    $("lgNet").hidden = g;
+    marker.setLatLng([st.lat, st.lon]).setOpacity(g ? 1 : 0);
+    netNow.clearLayers();
+    if (!g) {
+      L.circle([st.lat, st.lon], { ...NET_STYLE, radius: st.acc || 0, interactive: false }).addTo(netNow);
+      L.marker([st.lat, st.lon], { icon: L.divIcon({ className: "",
+        html: '<div class="net-marker"></div>', iconSize: [14, 14], iconAnchor: [7, 7] }) }).addTo(netNow);
+    }
+    $("coords").textContent = `parked since ${whenText(st.t0)} (${durText(Date.now() / 1000 - st.t0)}) · ` +
+      `${st.lat.toFixed(5)}, ${st.lon.toFixed(5)} · ${parkedText(st)}`;
+    if (!mapFitted) { map.setView([st.lat, st.lon], 16); mapFitted = true; }
+    return;
+  }
   const hasG = t.lat != null && t.lon != null;
   const hasN = t.net_lat != null && t.net_lon != null;
   // no position fields = no location entitlement (or no data): hide the map
@@ -1521,7 +1796,7 @@ function renderPosition(t, tts, updated) {
                        (gNow ? "" : " (last GNSS fix)"));
   if (nNow) {
     const acc = Number(t.net_acc_m ?? 0);
-    L.circle([t.net_lat, t.net_lon], { ...NET_STYLE, radius: acc }).addTo(netNow);
+    L.circle([t.net_lat, t.net_lon], { ...NET_STYLE, radius: acc, interactive: false }).addTo(netNow);
     L.marker([t.net_lat, t.net_lon], { icon: L.divIcon({ className: "",
       html: '<div class="net-marker"></div>', iconSize: [14, 14], iconAnchor: [7, 7] }) })
       .addTo(netNow);
@@ -1565,11 +1840,15 @@ function applyBundle(series) {
   if (sf && (series[sf.countKey] || []).length) cards[sf.key].hidden = false;
 
   const lonByT = new Map((series.lon || []).map(p => [p.t, p.v]));
-  histTrailPts = (series.lat || [])
-    .filter(p => lonByT.has(p.t))
-    .map(p => ({ t: p.t, lat: p.v, lon: lonByT.get(p.t), acc: 0 }));
-  const pts = histTrailPts.map(p => [p.lat, p.lon]);
-  drawPackTrail();
+  const nLonByT = new Map((series.net_lon || []).map(p => [p.t, p.v]));
+  const nAccByT = new Map((series.net_acc_m || []).map(p => [p.t, p.v]));
+  histTrack = {
+    series: (series.lat || []).filter(p => lonByT.has(p.t))
+      .map(p => ({ t: p.t, lat: p.v, lon: lonByT.get(p.t) })),
+    net: (series.net_lat || []).filter(p => nLonByT.has(p.t))
+      .map(p => ({ t: p.t, lat: p.v, lon: nLonByT.get(p.t), acc: nAccByT.get(p.t) ?? 0 })),
+  };
+  const pts = histTrack.series.map(p => [p.lat, p.lon]);
 
   // network positions in the range: one faint circle per distinct position
   // (the pack reports the same one in every sample while it holds)
@@ -1585,9 +1864,10 @@ function applyBundle(series) {
     if (seen.has(key)) continue;
     seen.add(key);
     netPts.push([lat, lon]);
-    L.circle([lat, lon], { ...NET_STYLE, opacity: .35, fillOpacity: .04, radius: acc })
-      .addTo(netTrail);
+    L.circle([lat, lon], { ...NET_STYLE, opacity: .35, fillOpacity: .04, radius: acc,
+                           interactive: false }).addTo(netTrail);
   }
+  drawPackTrail();                          // after netTrail: it shows or hides it
   if ((pts.length || netPts.length) && !mapFitted) {
     map.fitBounds(L.latLngBounds([...pts, ...netPts]), { maxZoom: 16, padding: [30, 30] });
     mapFitted = true;
@@ -1710,10 +1990,13 @@ function selectPack(pid) {
   $("sysState").textContent = "";
   trail.setLatLngs([]);
   trailGap.setLatLngs([]);
+  packHit.setLatLngs([]);
+  packMarks.clearLayers();
   packArrows.clearLayers();
-  histTrailPts = []; packTrailPts = null;
+  histTrack = { series: [], net: [] }; packPathV = null; packHolder = {}; packLatest = null;
   packTrack = null; packTrackKey = ""; packTrackOk = true;
   $("lgPath").hidden = true;
+  $("lgPackParked").hidden = true;
   netTrail.clearLayers();
   netNow.clearLayers();
   mapFitted = false;                                // re-center on the new pack
@@ -1867,24 +2150,35 @@ fleetMap.createPane("trails").style.zIndex = 420;
 fleetMap.createPane("trailArrows").style.zIndex = 450;
 const trailLayer = L.layerGroup().addTo(fleetMap);
 const arrowLayer = L.layerGroup().addTo(fleetMap);
+const fleetDots = L.canvas({ pane: "trails", padding: 0.2 });   // raw mode's dots
+const fleetRing = L.circleMarker([0, 0], { pane: "trailArrows", radius: 6, color: INK, weight: 2,
+                                           fillColor: "#fff", fillOpacity: .7, interactive: false });
 const TRAIL_RANGE = "24h";
 
-// The path a pack took: its GNSS fix where it had one, else its network
-// position, oldest first, ending at where the pack is now (simplifyPath drops
-// what is the same place within either point's uncertainty).
-function trailPoints(track, pos) {
-  if (!track) return null;
-  const pts = (track.series || []).map(p => ({ t: p.t, lat: p.lat, lon: p.lon, acc: 0 }));
-  const gnssT = new Set(pts.map(p => p.t));
-  for (const p of track.net || []) {
-    if (!gnssT.has(p.t)) pts.push({ t: p.t, lat: p.lat, lon: p.lon, acc: p.acc || 0 });
+// Where a card's pack is shown: filtering on and parked, its stay's position
+// (the most likely spot, steady); else the newest reading from /latest.
+// { kind, lat, lon, acc, t, current, parked: stay | null }
+function slotShown(s) {
+  const p = s.pos;
+  if (!p) return null;
+  if (!posFilter || !s.track) return { ...p, parked: null };
+  const an = analyse(s, s.track);
+  const st = parkedNow(an.rd, an.stays, p.t ? { lat: p.lat, lon: p.lon, t: p.t } : null);
+  if (!st) return { ...p, parked: null };
+  return { kind: st.src === "g" ? "gnss" : "net", lat: st.lat, lon: st.lon, acc: st.acc,
+           src: p.src, t: st.t1, current: true, parked: st };
+}
+// The path over the last 24 h (filtered: a stay is one vertex; raw: every
+// reading), ending at the marker.
+function slotPath(s) {
+  if (!s.track) return null;
+  const an = analyse(s, s.track), since = Date.now() / 1000 - RANGE_S[TRAIL_RANGE];
+  const v = (posFilter ? filteredPath(an.rd, an.stays) : rawPath(an.rd)).filter(x => x.tEnd >= since);
+  const sh = slotShown(s), p = s.pos;
+  if (sh && !sh.parked && p?.t && p.t >= since && (!v.length || p.t > v.at(-1).tEnd)) {
+    v.push({ t: p.t, tEnd: p.t, lat: p.lat, lon: p.lon, kind: p.kind === "gnss" ? "g" : "n", acc: p.acc || 0 });
   }
-  pts.sort((a, b) => a.t - b.t);
-  const since = Date.now() / 1000 - RANGE_S[TRAIL_RANGE];
-  if (pos && pos.t && pos.t >= since && (!pts.length || pos.t > pts.at(-1).t)) {
-    pts.push({ t: pos.t, lat: pos.lat, lon: pos.lon, acc: pos.acc || 0 });
-  }
-  return simplifyPath(pts);
+  return v.length >= 2 ? v : null;
 }
 
 // Hovering a pack's card or path brings its path forward and fades the
@@ -1893,44 +2187,60 @@ let trailFocus = null;
 function focusTrail(target) {
   trailFocus = target;
   for (const s of slots) {
-    const dim = !!target && target !== s;
+    const f = target && target !== s ? .4 : 1;
     for (const l of s.trailLines || []) {
-      l.setStyle({ opacity: l.options.baseOpacity * (dim ? .4 : 1) });
-      if (target === s) l.bringToFront();
+      l.setStyle({ opacity: l.options.baseOpacity * f, fillOpacity: (l.options.baseFill ?? 0) * f });
+      // forward: the drawn layers only -- moving the hover line itself in the
+      // page while the cursor is on it stops its mouse events (Chrome)
+      if (target === s && l.bringToFront && l.options.interactive === false) l.bringToFront();
     }
-    for (const m of s.arrows || []) m.setOpacity(dim ? .4 : 1);
+    for (const m of s.arrows || []) m.setOpacity(f);
   }
 }
 
+// line (white halo + ink, dotted across gaps), raw dots or parked rings, and
+// an invisible wide line on top that names the reading under the cursor
 function drawTrail(s) {
   s.trailLines = [];
-  if (!s.trailPts) return;
-  const { solid, dotted } = splitRuns(s.trailPts);
-  const tip = `${s.pid} · path, last 24 h`;
-  const line = (lls, opt) => {
-    const l = L.polyline(lls, { pane: "trails", ...opt, baseOpacity: opt.opacity }).addTo(trailLayer);
-    s.trailLines.push(l);
-    if (opt.interactive !== false) {
-      l.on("mouseover", () => focusTrail(s)).on("mouseout", () => focusTrail(null));
-    }
-    return l;
+  const v = s.path;
+  if (!v) return 0;
+  const { solid, dotted } = splitRuns(v);
+  const add = (layer, base, fill) => {
+    layer.options.baseOpacity = base; layer.options.baseFill = fill;
+    s.trailLines.push(layer.addTo(trailLayer));
+    return layer;
   };
-  line([...solid, ...dotted], { color: "#fff", weight: 6, opacity: .75, interactive: false });
-  if (solid.length) {
-    line(solid, { color: INK, weight: 2.5, opacity: .9 }).bindTooltip(tip, { sticky: true });
+  add(L.polyline([...solid, ...dotted], { pane: "trails", color: "#fff", weight: 6, opacity: .75,
+                                          interactive: false }), .75);
+  if (solid.length) add(L.polyline(solid, { pane: "trails", color: INK, weight: 2.5, opacity: .9,
+                                            interactive: false }), .9);
+  if (dotted.length) add(L.polyline(dotted, { pane: "trails", color: INK, weight: 2.5, opacity: .9,
+                                              dashArray: "1 6", lineCap: "round", interactive: false }), .9);
+  const cur = slotShown(s)?.parked;
+  let rings = 0;
+  for (const p of v) {
+    if (!posFilter) {                         // raw: every reading, GNSS ink / network blue
+      add(L.circleMarker([p.lat, p.lon], { renderer: fleetDots, radius: 2, stroke: false,
+            fillColor: p.kind === "n" ? NET_BLUE : INK, fillOpacity: .8, interactive: false }), 0, .8);
+    } else if (p.kind === "stay" && p.stay !== cur) {
+      rings++;
+      add(L.circleMarker([p.lat, p.lon], { pane: "trailArrows", radius: 5, color: INK, weight: 2,
+            fillColor: "#fff", fillOpacity: 1, interactive: false }), 1, 1);
+    }
   }
-  if (dotted.length) {
-    line(dotted, { color: INK, weight: 2.5, opacity: .9, dashArray: "1 6", lineCap: "round" })
-      .bindTooltip(tip + " · no readings here", { sticky: true });
-  }
+  const hit = add(L.polyline([...solid, ...dotted], { pane: "trails", color: INK, weight: 16,
+                                                      opacity: 0 }), 0);
+  attachPathHover(fleetMap, hit, () => v, `${s.pid} · `, fleetRing,
+                  { onEnter: () => focusTrail(s), onLeave: () => focusTrail(null) });
+  return rings;
 }
 
 // the arrowheads, redrawn after every pan / zoom (placeArrows)
 function drawArrows() {
   arrowLayer.clearLayers();
   for (const s of slots) {
-    s.arrows = s.pid && s.trailPts
-      ? placeArrows(fleetMap, arrowLayer, s.trailPts,
+    s.arrows = s.pid && s.path
+      ? placeArrows(fleetMap, arrowLayer, s.path,
                     { opacity: trailFocus && trailFocus !== s ? .4 : 1 })
       : [];
   }
@@ -1957,7 +2267,7 @@ function saveFleet() {
 function makeSlot(i) {
   const s = { i, pid: "", d: null, err: "", seen: undefined, pos: null, marker: null,
               sparkAt: 0, faults: null, faultsAt: 0, faultsOk: true,
-              track: null, trackAt: 0, trackOk: true, trailPts: null, el: {} };
+              track: null, trackAt: 0, trackOk: true, path: null, anTrack: null, an: null, el: {} };
   const e = s.el, mk = (tag, cls, parent) => {
     const x = document.createElement(tag);
     if (cls) x.className = cls;
@@ -1965,7 +2275,7 @@ function makeSlot(i) {
     return x;
   };
   e.card = mk("article", "pcard", $("fleet"));
-  e.card.addEventListener("mouseenter", () => { if (s.trailPts) focusTrail(s); });
+  e.card.addEventListener("mouseenter", () => { if (s.path) focusTrail(s); });
   e.card.addEventListener("mouseleave", () => focusTrail(null));
   const top = mk("div", "top", e.card);
   e.sel = mk("select", "packsel", top);
@@ -2008,7 +2318,7 @@ function setSlotPack(s, pid) {
   if (s.pid === pid) return;
   Object.assign(s, { pid, d: null, err: "", seen: undefined, pos: null, marker: null,
                      sparkAt: 0, faults: null, faultsAt: 0, faultsOk: true,
-                     track: null, trackAt: 0, trackOk: true, trailPts: null });
+                     track: null, trackAt: 0, trackOk: true, path: null, anTrack: null, an: null });
   s.el.sel.value = pid;
   s.spark.set(null);
   renderSlot(s);
@@ -2113,13 +2423,13 @@ function renderSlot(s) {
         n ? `latest ${FAULT_NAMES[parseInt(f.code, 16)] || "unknown fault"} (${f.code}), ${whenText(f.t)}` : "");
     if (n) rows.at(-1).flag = true;
   }
-  const p = s.pos;
+  const p = slotShown(s);
   if (p) {
-    const what = p.kind === "gnss" ? "GNSS fix"
-      : `Network ± ${fmt(p.acc, 0)} m (${NET_SRC[p.src] || "?"})`;
+    const what = p.parked ? `Parked since ${whenText(p.parked.t0)}`
+      : p.kind === "gnss" ? "GNSS fix" : `Network ± ${fmt(p.acc, 0)} m (${NET_SRC[p.src] || "?"})`;
     add("Location", what,
         `${Number(p.lat).toFixed(5)}, ${Number(p.lon).toFixed(5)}` +
-        (p.current || !p.t ? "" : ` · as of ${whenText(p.t)}`),
+        (p.parked ? ` · ${parkedText(p.parked)}` : p.current || !p.t ? "" : ` · as of ${whenText(p.t)}`),
         () => focusPack(s));
   }
   e.facts.replaceChildren(...rows.flatMap(r => {
@@ -2148,13 +2458,15 @@ const FAULTS_SHOWN = 200;                  // the API's cap on /faults rows
 function renderFleetMap() {
   fleetLayer.clearLayers();
   trailLayer.clearLayers();
+  fleetRing.remove();
   const pts = [];
+  let rings = 0;
   for (const s of slots) {
     s.marker = null;
-    s.trailPts = s.pid ? trailPoints(s.track, s.pos) : null;
-    drawTrail(s);
-    for (const t of s.trailPts || []) pts.push([t.lat, t.lon]);
-    const p = s.pid && s.pos;
+    s.path = s.pid ? slotPath(s) : null;
+    rings += drawTrail(s);
+    for (const t of s.path || []) pts.push([t.lat, t.lon]);
+    const p = s.pid && slotShown(s);
     if (!p) continue;
     const { online } = slotOnline(s);
     if (p.kind === "net") {
@@ -2164,7 +2476,9 @@ function renderFleetMap() {
     s.marker = L.marker([p.lat, p.lon], {
       icon: L.divIcon({ className: "", iconSize: [14, 14], iconAnchor: [7, 7],
                         html: `<div class="${p.kind === "gnss" ? "pack-marker" : "net-marker"}"></div>` }),
-      opacity: online ? 1 : .6, title: `Open ${s.pid}`,
+      opacity: online ? 1 : .6,
+      title: (p.parked ? `${s.pid} · parked since ${whenText(p.parked.t0)} ` +
+                         `(${durText(Date.now() / 1000 - p.parked.t0)}) · ` : "") + `open ${s.pid}`,
     }).bindTooltip(s.pid + (online ? "" : " (offline)"),
                    { permanent: true, direction: LABEL_DIR[s.i], offset: LABEL_OFF[s.i],
                      className: "fleet-label" })
@@ -2173,12 +2487,13 @@ function renderFleetMap() {
     pts.push([p.lat, p.lon]);
   }
   setFleetMapVisible(pts.length > 0);
-  $("lgTrail").hidden = !slots.some(s => s.trailPts);
+  $("lgTrail").hidden = !slots.some(s => s.path);
+  $("lgParked").hidden = !rings;
   drawArrows();
-  if (trailFocus) focusTrail(trailFocus.trailPts ? trailFocus : null);
+  if (trailFocus) focusTrail(trailFocus.path ? trailFocus : null);
   // fit once per set of packs shown (and when a path arrives), never
   // fighting the user's own pan/zoom
-  const key = slots.map(s => s.pid + (s.pos ? "@" : "") + (s.trailPts ? "~" : "")).join("|");
+  const key = slots.map(s => s.pid + (s.pos ? "@" : "") + (s.path ? "~" : "")).join("|");
   if (pts.length && key !== fleetFitKey) {
     fleetFitKey = key;
     setTimeout(() => {
@@ -2190,8 +2505,9 @@ function renderFleetMap() {
 }
 
 function focusPack(s) {
-  if (!s.pos) return;
-  fleetMap.setView([s.pos.lat, s.pos.lon], Math.max(fleetMap.getZoom(), 16));
+  const p = slotShown(s);
+  if (!p) return;
+  fleetMap.setView([p.lat, p.lon], Math.max(fleetMap.getZoom(), 16));
   $("fleetMapCard").scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
 
@@ -2276,6 +2592,17 @@ function makeExpandable(card, lmap) {
   mapToggles.push(set);
 }
 makeExpandable($("fleetMapCard"), fleetMap);
+for (const c of document.querySelectorAll(".posfilter")) {
+  c.checked = posFilter;
+  c.addEventListener("change", () => {
+    posFilter = c.checked;
+    try { localStorage.setItem("helt_posfilter", posFilter ? "1" : "0"); } catch {}
+    for (const o of document.querySelectorAll(".posfilter")) o.checked = posFilter;
+    drawPackTrail();
+    for (const s of slots) renderSlot(s);
+    renderFleetMap();
+  });
+}
 makeExpandable($("packMapCard"), map);
 const collapseMaps = () => mapToggles.forEach(set => set(false));
 document.addEventListener("keydown", e => { if (e.key === "Escape") collapseMaps(); });
