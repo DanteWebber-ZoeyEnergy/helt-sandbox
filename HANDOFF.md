@@ -613,6 +613,21 @@ floor). Cost: no API change; ~6-13 ms per pack per new /track answer in the
 browser, ~6 ms per fleet redraw (raw mode ~50 ms: ~9,000 dots). Moves under
 250 m do not show while filtering. HELT-0002's GNSS sat ~20 m west of 0001 /
 0003 on 2026-10-02 (packs together) -- unexplained.
+Fix (2026-10-03 evening): HELT-0001 / 0002 drove off (~20:00 SAST) with no
+GNSS fix and the firmware withholding the old network position once moving,
+so their newest samples carried no position; the pack view hid its map and
+the fleet showed no marker (and with the 6-min ONLINE_S they read as online,
+so /latest only looked back 15 min). Now both maps fall back to the last
+known position (newest of /latest, the path data, else /latest?lookback=30d,
+cached 5 min), faded and dated "no position reported since"; the pack map
+hides only with no position at all. Filter: a trailing excursion counts as
+"left" once the pack's newest sample is LEAVE_S past it with no reading back
+(settleTail -- no reading ever comes back when it loses every source), the
+scan restarts reading by reading after a departure, and a stay qualifies on
+its own readings only. Known gap: /track has no net_age_s, so a moving pack
+that keeps repeating an old network position (it did for ~1.5 h, ages up to
+3.6 h) still looks parked there -- adding net_age_s to /track (query Lambda)
+would let the dashboard date those by measurement time.
 
 **Next for the real pack:** the firmware repo's open issue on the internal-RAM
 budget with Wi-Fi up (instrument the boot, trim the Wi-Fi buffer pools, LVGL

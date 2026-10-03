@@ -1412,17 +1412,27 @@ function findStays(rd) {
     if (out0 < 0) out0 = i;
     if (rd[i].t - rd[out0].t >= PARK.LEAVE_S) {   // really left
       flush(i0, out0 - 1);
-      i0 = out0; i1 = i; out0 = -1; cache = null;
+      // start over from the first reading away, one at a time: the readings
+      // since may be on the move, not one new place
+      i0 = i1 = i = out0; out0 = -1; cache = null;
     }
   }
-  flush(i0, rd.length - 1);
+  stays.tail = -1;
+  if (out0 < 0) flush(i0, rd.length - 1);
+  else if (rd[out0 - 1].t - rd[i0].t >= PARK.MIN_S) {
+    // newest readings outside the stay, not yet for LEAVE_S: kept in it for
+    // now (a jump that comes back is wander) -- settleTail() decides later.
+    // The stay qualifies on its own readings, never on these.
+    stays.push({ i0, i1: rd.length - 1 });
+    stays.tail = out0;
+  }
   return stays;
 }
 // findStays + merging stays that turn out to be the same place, each with
 // its position: [{i0, i1, t0, t1, lat, lon, src, n, acc?}]
 function parkedStays(rd) {
-  const out = [];
-  for (const s of findStays(rd)) {
+  const out = [], found = findStays(rd);
+  for (const s of found) {
     let st = { ...s, ...stayPosition(rd, s.i0, s.i1) };
     const prev = out.at(-1);
     if (prev && rd[st.i0].t - rd[prev.i1].t <= PARK.MERGE_GAP_S && distM(prev, st) <= PARK.MERGE_M) {
@@ -1432,6 +1442,24 @@ function parkedStays(rd) {
     out.push(st);
   }
   for (const s of out) { s.t0 = rd[s.i0].t; s.t1 = rd[s.i1].t; }
+  out.tail = out.length && out.at(-1).i1 === rd.length - 1 ? found.tail : -1;
+  return out;
+}
+// The pack's newest readings sit outside its last stay (stays.tail). Once
+// nowT (its newest sample, positioned or not) is LEAVE_S past the first of
+// them with no reading back near the stay, it left: the stay ends there and
+// they are movement. A pack that drives off and loses every position source
+// still gets here -- no reading ever comes back.
+function settleTail(rd, stays, nowT) {
+  const k = stays.tail, s = stays.at(-1);
+  if (!s || k == null || k <= s.i0 || !(nowT - rd[k].t >= PARK.LEAVE_S)) return stays;
+  const out = stays.slice(0, -1);
+  out.tail = -1;
+  if (rd[k - 1].t - rd[s.i0].t >= PARK.MIN_S) {
+    const cut = { i0: s.i0, i1: k - 1, ...stayPosition(rd, s.i0, k - 1) };
+    cut.t0 = rd[cut.i0].t; cut.t1 = rd[cut.i1].t;
+    out.push(cut);
+  }
   return out;
 }
 // The path to draw: one vertex per stay (t .. tEnd = its span), every reading
@@ -1476,6 +1504,14 @@ function analyse(holder, track) {
     holder.an = { rd, stays: parkedStays(rd) };
   }
   return holder.an;
+}
+// analyse()'s stays with the tail settled for nowT (cached per answer)
+function settledStays(holder, nowT) {
+  const an = holder.an, k = an.stays.tail, s = an.stays.at(-1);
+  const cut = !!s && k > s.i0 && (nowT || 0) - an.rd[k].t >= PARK.LEAVE_S;
+  if (!cut) return an.stays;
+  if (holder.cutFor !== an) { holder.cutFor = an; holder.cutStays = settleTail(an.rd, an.stays, nowT); }
+  return holder.cutStays;
 }
 function durText(sec) {
   return sec < 3600 ? `${Math.max(1, Math.round(sec / 60))} min`
@@ -1571,6 +1607,36 @@ function placeArrows(lmap, layer, pts, { cls = "", opacity = 1 } = {}) {
   return out;
 }
 
+// A pack's newest readings can carry no position at all -- no GNSS fix, and
+// the firmware withholds an old network position once the pack moves -- while
+// it keeps reporting. Then the maps show the last known position (faded, with
+// its time), never nothing: the newest of /latest, the path data, else a
+// 30-day lookup.
+function readingPos(r, updated) {
+  return r ? { kind: r.src === "g" ? "gnss" : "net", lat: r.lat, lon: r.lon, acc: r.acc, t: r.t,
+               current: !!updated && r.t >= updated - 2 } : null;
+}
+function newestPos(...cands) {
+  return cands.filter(Boolean).reduce((a, b) => (!a || (b.t ?? 0) > (a.t ?? 0) ? b : a), null);
+}
+// /latest?lookback=30d's position for a pack, cached 5 min; `then` runs when
+// a fetch lands (the caller redraws). Returns what is cached (or null).
+const pos30 = new Map();
+function lastPos30(pid, then) {
+  const c = pos30.get(pid);
+  if (c && (c.busy || Date.now() - c.at < 5 * 60 * 1000)) return c.pos;
+  const e = { at: Date.now(), pos: c ? c.pos : null, busy: true };
+  pos30.set(pid, e);
+  getJSON(`/packs/${encodeURIComponent(pid)}/latest?lookback=30d`)
+    .then(d => {
+      e.pos = packPosition(d.telemetry || {}, d.telemetry_ts || {}, d.updated_ts);
+      if (e.pos) e.pos.current = false;
+    })
+    .catch(err => console.warn("last position:", err))
+    .finally(() => { e.busy = false; e.at = Date.now(); if (then) then(); });
+  return e.pos;
+}
+
 /* --------------------------------- map ----------------------------------- */
 const map = L.map("map", { zoomControl: true, attributionControl: true });
 L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png",
@@ -1606,7 +1672,8 @@ function packTrackData() {
 }
 function drawPackTrail() {
   const an = analyse(packHolder, packTrackData());
-  const v = posFilter ? filteredPath(an.rd, an.stays) : rawPath(an.rd.filter(p => p.src === "g"));
+  const v = posFilter ? filteredPath(an.rd, settledStays(packHolder, packLatest && packLatest.updated))
+                      : rawPath(an.rd.filter(p => p.src === "g"));
   packPathV = v.length >= 2 ? v : null;
   const { solid, dotted } = packPathV ? splitRuns(packPathV) : { solid: [], dotted: [] };
   trail.setLatLngs(solid);
@@ -1745,7 +1812,7 @@ async function pollLatest() {
 // fix (and lat/lon while it has none), so an older one is history, not "now".
 function renderPosition(t, tts, updated) {
   packLatest = { t, tts, updated };
-  drawPackPosition();
+  drawPackTrail();                          // the stay's end can move with `updated`
 }
 // Filtering on and the pack parked: its stay's position, not the newest
 // (wandering) reading -- unless /latest has it more than R_M away (it left).
@@ -1753,7 +1820,8 @@ function parkedNowPack() {
   const an = packHolder.an;
   if (!posFilter || !an) return null;
   const l = packLatest && packPosition(packLatest.t, packLatest.tts || {}, packLatest.updated);
-  return parkedNow(an.rd, an.stays, l && l.t ? { lat: l.lat, lon: l.lon, t: l.t } : null);
+  return parkedNow(an.rd, settledStays(packHolder, packLatest && packLatest.updated),
+                   l && l.t ? { lat: l.lat, lon: l.lon, t: l.t } : null);
 }
 function drawPackPosition() {
   if (!packLatest) return;
@@ -1778,11 +1846,11 @@ function drawPackPosition() {
   }
   const hasG = t.lat != null && t.lon != null;
   const hasN = t.net_lat != null && t.net_lon != null;
-  // no position fields = no location entitlement (or no data): hide the map
-  setMapVisible(hasG || hasN);
   const cur = k => !tts || !updated || (tts[k] != null && tts[k] >= updated - 2);
   const gNow = hasG && cur("lat");
   const nNow = hasN && cur("net_lat");
+  if (!gNow && !nNow) return drawLastKnown(t, tts, updated, hasG, hasN);
+  setMapVisible(true);
   $("lgGnss").hidden = !hasG;
   $("lgNet").hidden = !hasN;
 
@@ -1810,6 +1878,40 @@ function drawPackPosition() {
     else map.setView([t.lat, t.lon], 15);
     mapFitted = true;
   }
+}
+// No position came with the newest sample: the newest known one -- /latest's
+// older GNSS or network value, the range's path data, else the 30-day lookup
+// -- faded, with its time. The map hides only when there is none at all (no
+// location entitlement, or no position ever).
+function drawLastKnown(t, tts, updated, hasG, hasN) {
+  const lp = newestPos(
+    hasG && { kind: "gnss", lat: t.lat, lon: t.lon, t: tts.lat },
+    hasN && { kind: "net", lat: t.net_lat, lon: t.net_lon, acc: Number(t.net_acc_m ?? 0),
+              src: t.net_src, t: tts.net_lat },
+    readingPos(packHolder.an && packHolder.an.rd.at(-1), updated)
+  ) || lastPos30(PACK, drawPackPosition);
+  netNow.clearLayers();
+  setMapVisible(!!lp || !!packPathV);
+  if (!lp) {
+    marker.setOpacity(0);
+    $("coords").textContent = "no position reported";
+    return;
+  }
+  const g = lp.kind === "gnss";
+  $("lgGnss").hidden = !g;
+  $("lgNet").hidden = g;
+  marker.setLatLng([lp.lat, lp.lon]).setOpacity(g ? .5 : 0);
+  if (!g) {
+    L.circle([lp.lat, lp.lon], { ...NET_STYLE, opacity: .4, fillOpacity: .05, radius: lp.acc || 0,
+                                 interactive: false }).addTo(netNow);
+    L.marker([lp.lat, lp.lon], { opacity: .5, icon: L.divIcon({ className: "",
+      html: '<div class="net-marker"></div>', iconSize: [14, 14], iconAnchor: [7, 7] }) }).addTo(netNow);
+  }
+  $("coords").textContent = `last known position ${lp.t ? whenText(lp.t) : ""} · ` +
+    `${Number(lp.lat).toFixed(5)}, ${Number(lp.lon).toFixed(5)} · ` +
+    (g ? "GNSS" : `network ± ${fmt(lp.acc, 0)} m` + (NET_SRC[lp.src] ? ` (${NET_SRC[lp.src]})` : "")) +
+    " · no position reported since";
+  if (!mapFitted) { map.setView([lp.lat, lp.lon], 15); mapFitted = true; }
 }
 
 let bundledApi = true;   // flips off if the deployed Lambda predates /histories
@@ -2163,7 +2265,8 @@ function slotShown(s) {
   if (!p) return null;
   if (!posFilter || !s.track) return { ...p, parked: null };
   const an = analyse(s, s.track);
-  const st = parkedNow(an.rd, an.stays, p.t ? { lat: p.lat, lon: p.lon, t: p.t } : null);
+  const st = parkedNow(an.rd, settledStays(s, s.d && s.d.updated_ts),
+                       p.t ? { lat: p.lat, lon: p.lon, t: p.t } : null);
   if (!st) return { ...p, parked: null };
   return { kind: st.src === "g" ? "gnss" : "net", lat: st.lat, lon: st.lon, acc: st.acc,
            src: p.src, t: st.t1, current: true, parked: st };
@@ -2173,7 +2276,8 @@ function slotShown(s) {
 function slotPath(s) {
   if (!s.track) return null;
   const an = analyse(s, s.track), since = Date.now() / 1000 - RANGE_S[TRAIL_RANGE];
-  const v = (posFilter ? filteredPath(an.rd, an.stays) : rawPath(an.rd)).filter(x => x.tEnd >= since);
+  const v = (posFilter ? filteredPath(an.rd, settledStays(s, s.d && s.d.updated_ts)) : rawPath(an.rd))
+    .filter(x => x.tEnd >= since);
   const sh = slotShown(s), p = s.pos;
   if (sh && !sh.parked && p?.t && p.t >= since && (!v.length || p.t > v.at(-1).tEnd)) {
     v.push({ t: p.t, tEnd: p.t, lat: p.lat, lon: p.lon, kind: p.kind === "gnss" ? "g" : "n", acc: p.acc || 0 });
@@ -2391,6 +2495,13 @@ function renderSlot(s) {
   e.body.hidden = !has;
   e.nodata.hidden = has;
   s.pos = has ? packPosition(t, tts, upd) : null;
+  if (has && s.pid && !(s.pos && s.pos.current)) {
+    // no position with the newest sample: the newest known (this pack's 24 h
+    // path, else the 30-day lookup)
+    const r = s.track ? analyse(s, s.track).rd.at(-1) : null;
+    s.pos = newestPos(s.pos, readingPos(r, upd)) ||
+            lastPos30(s.pid, () => { if (view === "fleet") { renderSlot(s); renderFleetMap(); } });
+  }
   if (!has) {
     e.nodata.textContent = !s.pid ? "Pick a pack for this card."
       : s.err ? `⚠ ${s.err}` : !s.d ? "Loading…" : "No recent readings.";
@@ -2425,11 +2536,14 @@ function renderSlot(s) {
   }
   const p = slotShown(s);
   if (p) {
+    const src = p.kind === "gnss" ? "GNSS fix"
+      : `Network ± ${fmt(p.acc, 0)} m` + (NET_SRC[p.src] ? ` (${NET_SRC[p.src]})` : "");
     const what = p.parked ? `Parked since ${whenText(p.parked.t0)}`
-      : p.kind === "gnss" ? "GNSS fix" : `Network ± ${fmt(p.acc, 0)} m (${NET_SRC[p.src] || "?"})`;
+      : p.current || !p.t ? src : `Last known position, ${whenText(p.t)}`;
     add("Location", what,
         `${Number(p.lat).toFixed(5)}, ${Number(p.lon).toFixed(5)}` +
-        (p.parked ? ` · ${parkedText(p.parked)}` : p.current || !p.t ? "" : ` · as of ${whenText(p.t)}`),
+        (p.parked ? ` · ${parkedText(p.parked)}`
+         : p.current || !p.t ? "" : ` · ${src} · no position reported since`),
         () => focusPack(s));
   }
   e.facts.replaceChildren(...rows.flatMap(r => {
@@ -2469,17 +2583,21 @@ function renderFleetMap() {
     const p = s.pid && slotShown(s);
     if (!p) continue;
     const { online } = slotOnline(s);
+    // a last known position (none with the newest sample) is faded and dated
+    const stale = !p.parked && !p.current && !!p.t;
     if (p.kind === "net") {
-      L.circle([p.lat, p.lon], { ...NET_STYLE, radius: p.acc,
-                                 opacity: online ? .7 : .4 }).addTo(fleetLayer);
+      L.circle([p.lat, p.lon], { ...NET_STYLE, radius: p.acc || 0, interactive: false,
+                                 opacity: online && !stale ? .7 : .4,
+                                 fillOpacity: online && !stale ? .1 : .05 }).addTo(fleetLayer);
     }
     s.marker = L.marker([p.lat, p.lon], {
       icon: L.divIcon({ className: "", iconSize: [14, 14], iconAnchor: [7, 7],
                         html: `<div class="${p.kind === "gnss" ? "pack-marker" : "net-marker"}"></div>` }),
-      opacity: online ? 1 : .6,
+      opacity: !online ? .6 : stale ? .5 : 1,
       title: (p.parked ? `${s.pid} · parked since ${whenText(p.parked.t0)} ` +
                          `(${durText(Date.now() / 1000 - p.parked.t0)}) · ` : "") + `open ${s.pid}`,
-    }).bindTooltip(s.pid + (online ? "" : " (offline)"),
+    }).bindTooltip(s.pid + (online ? "" : " (offline)") +
+                   (stale ? ` · last position ${whenText(p.t)}` : ""),
                    { permanent: true, direction: LABEL_DIR[s.i], offset: LABEL_OFF[s.i],
                      className: "fleet-label" })
       .on("click", () => openPack(s.pid))
