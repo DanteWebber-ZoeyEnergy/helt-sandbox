@@ -1326,9 +1326,20 @@ const NET_BLUE = "#2a78d6";               // --s1, the network position's hue
    stays within MERGE_M are one (what lay between was wander). A stay's
    position is the densest cluster of its GNSS fixes (a stray fix moves it
    nowhere); with fewer than MIN_GNSS fixes, its network (WiFi / cell)
-   position. Moves shorter than R_M do not show while filtering is on. */
+   position. Moves shorter than R_M do not show while filtering is on.
+   The newest readings outside the last stay end it (the pack left) once
+   LEAVE_S pass with no reading back, or at once while the pack uploads at
+   its moving rate (its own motion detection) -- so a parked pack's stray
+   fix moves neither the marker nor the path. Every /latest poll adds its
+   positions to the path readings (mergeLive) until the next /track
+   re-read replaces them, so the path runs up to the marker. */
 const PARK = { R_M: 250, MIN_S: 600, LEAVE_S: 300, MERGE_M: 150, MERGE_GAP_S: 3600,
                BW_M: 15, MIN_GNSS: 10, MAX_FIT_PTS: 1500 };
+// Uploading at the moving rate: a moving pack publishes every 10 s
+// (firmware CLOUD_MOVING_PERIOD_S), a parked one every 300 s
+// (CLOUD_CELL_BATCH_PERIOD_S); 90 s lies between, with room for the 30 s
+// poll and the server's 30 s cache.
+const FAST_UPLOAD_S = 90;
 const M_PER_DEG = 111320;
 function distM(a, b) {                          // haversine, {lat, lon} in degrees
   const r = Math.PI / 180, la1 = a.lat * r, la2 = b.lat * r;
@@ -1447,12 +1458,13 @@ function parkedStays(rd) {
 }
 // The pack's newest readings sit outside its last stay (stays.tail). Once
 // nowT (its newest sample, positioned or not) is LEAVE_S past the first of
-// them with no reading back near the stay, it left: the stay ends there and
-// they are movement. A pack that drives off and loses every position source
-// still gets here -- no reading ever comes back.
-function settleTail(rd, stays, nowT) {
+// them with no reading back near the stay -- or at once while `moving` (it
+// uploads at its moving rate) -- it left: the stay ends there and they are
+// movement. A pack that drives off and loses every position source still
+// gets here -- no reading ever comes back.
+function settleTail(rd, stays, nowT, moving) {
   const k = stays.tail, s = stays.at(-1);
-  if (!s || k == null || k <= s.i0 || !(nowT - rd[k].t >= PARK.LEAVE_S)) return stays;
+  if (!s || k == null || k <= s.i0 || !(moving || nowT - rd[k].t >= PARK.LEAVE_S)) return stays;
   const out = stays.slice(0, -1);
   out.tail = -1;
   if (rd[k - 1].t - rd[s.i0].t >= PARK.MIN_S) {
@@ -1489,6 +1501,56 @@ function parkedNow(rd, stays, latest) {
   if (latest && latest.t > s.t1 && distM(s, latest) > PARK.R_M) return null;
   return s;
 }
+// The positions a /latest answer carries, each at the time it was reported
+// (telemetry_ts): the GNSS fix and/or the network position. A time more
+// than a minute ahead of nowT (a clock not yet set) is left out.
+function liveReadings(t, tts, nowT) {
+  const out = [], ok = ts => ts && ts <= nowT + 60;
+  if (t.lat != null && t.lon != null && ok(tts?.lat)) {
+    out.push({ t: tts.lat, lat: Number(t.lat), lon: Number(t.lon), acc: 0, src: "g" });
+  }
+  if (t.net_lat != null && t.net_lon != null && ok(tts?.net_lat)) {
+    out.push({ t: tts.net_lat, lat: Number(t.net_lat), lon: Number(t.net_lon),
+               acc: Number(t.net_acc_m ?? 0), src: "n" });
+  }
+  return out;
+}
+// the newest reading time in a /track answer (0 for none)
+function trackEnd(track) {
+  return Math.max(track?.series?.at(-1)?.t ?? 0, track?.net?.at(-1)?.t ?? 0);
+}
+// live readings (time order) + new ones, each once, none at or before
+// `after` (what /track already holds); the same array when nothing changes
+function addLive(live, rs, after) {
+  const keep = live.filter(r => r.t > after);
+  const add = rs.filter(r => r.t > after && !keep.some(k => k.t === r.t && k.src === r.src));
+  if (!add.length && keep.length === live.length) return live;
+  return keep.concat(add).sort((a, b) => a.t - b.t).slice(-5000);
+}
+// /track's answer with the live readings newer than its newest appended
+function mergeLive(track, live) {
+  const end = trackEnd(track);
+  const g = [], n = [];
+  for (const r of live) {
+    if (r.t <= end) continue;
+    if (r.src === "g") g.push({ t: r.t, lat: r.lat, lon: r.lon });
+    else n.push({ t: r.t, lat: r.lat, lon: r.lon, acc: r.acc });
+  }
+  if (!g.length && !n.length) return track;
+  return { series: (track.series || []).concat(g), net: (track.net || []).concat(n) };
+}
+// The newest-reading times (/latest updated_ts) seen so far, each once,
+// oldest first: the last few are enough.
+function noteUpload(seen, u) {
+  if (!u || (seen.length && u <= seen.at(-1))) return seen;
+  return seen.concat(u).slice(-4);
+}
+// Uploading at the moving rate now: the last two uploads FAST_UPLOAD_S or
+// less apart, and the newest no older than that at nowT.
+function fastUploads(seen, nowT) {
+  const n = seen.length;
+  return n >= 2 && seen[n - 1] - seen[n - 2] <= FAST_UPLOAD_S && nowT - seen[n - 1] <= FAST_UPLOAD_S;
+}
 /* </position-filter> */
 
 
@@ -1505,14 +1567,39 @@ function analyse(holder, track) {
   }
   return holder.an;
 }
-// analyse()'s stays with the tail settled for nowT (cached per answer)
-function settledStays(holder, nowT) {
+// analyse()'s stays with the tail settled for nowT / moving (cached per answer)
+function settledStays(holder, nowT, moving) {
   const an = holder.an, k = an.stays.tail, s = an.stays.at(-1);
-  const cut = !!s && k > s.i0 && (nowT || 0) - an.rd[k].t >= PARK.LEAVE_S;
+  const cut = !!s && k > s.i0 && (moving || (nowT || 0) - an.rd[k].t >= PARK.LEAVE_S);
   if (!cut) return an.stays;
-  if (holder.cutFor !== an) { holder.cutFor = an; holder.cutStays = settleTail(an.rd, an.stays, nowT); }
+  if (holder.cutFor !== an) { holder.cutFor = an; holder.cutStays = settleTail(an.rd, an.stays, nowT, moving); }
   return holder.cutStays;
 }
+// A /track answer with the positions the /latest polls brought since it was
+// read: `holder` keeps the live readings (live), the upload times seen
+// (ups) and the merged answer, rebuilt only when either input changes.
+function withLive(holder, track) {
+  if (!track) return null;
+  if (holder.mergedFrom !== track || holder.mergedLive !== holder.live) {
+    holder.mergedFrom = track; holder.mergedLive = holder.live;
+    holder.merged = mergeLive(track, holder.live || []);
+  }
+  return holder.merged;
+}
+// After a /latest answer: its upload time, and its positions from `since`
+// on, into `holder`; `track` is the path answer they extend (live readings
+// it already holds are dropped).
+function takeLatest(holder, d, track, since) {
+  const now = Date.now() / 1000;
+  holder.ups = noteUpload(holder.ups || [], d.updated_ts || 0);
+  const rs = liveReadings(d.telemetry || {}, d.telemetry_ts || {}, now).filter(r => r.t >= since);
+  holder.live = addLive(holder.live || [], rs, trackEnd(track));
+}
+// a newer /track answer: the live readings it now holds go
+function dropHeldLive(holder, track) {
+  if (holder.live) holder.live = addLive(holder.live, [], trackEnd(track));
+}
+const isMoving = holder => fastUploads(holder.ups || [], Date.now() / 1000);
 function durText(sec) {
   return sec < 3600 ? `${Math.max(1, Math.round(sec / 60))} min`
        : sec < 48 * 3600 ? `${(sec / 3600).toFixed(1)} h` : `${(sec / 86400).toFixed(1)} d`;
@@ -1663,16 +1750,20 @@ const packRing = L.circleMarker([0, 0], { pane: "trailArrows", radius: 6, color:
 const PACK_TRACK_MS = 2 * 60 * 1000;      // the fine path is re-read every 2 min
 let histTrack = { series: [], net: [] };  // the positions in the chart data
 let packTrack = null, packTrackKey = "", packTrackAt = 0, packTrackOk = true;
-let packHolder = {};                      // analyse() cache for the shown pack
+let packHolder = {};                      // analyse() cache + live readings, shown pack
 let packPathV = null;                     // the path as drawn (vertices)
 let packLatest = null;                    // /latest: { t, tts, updated }
 attachPathHover(map, packHit, () => packPathV, "", packRing);
-function packTrackData() {
+// the path answer (/track, else the chart data), and with every /latest
+// position since appended -- the path runs up to the marker after each poll
+function packTrackBase() {
   return packTrack && packTrackKey === `${PACK}|${range}` ? packTrack : histTrack;
 }
+function packTrackData() { return withLive(packHolder, packTrackBase()); }
 function drawPackTrail() {
   const an = analyse(packHolder, packTrackData());
-  const v = posFilter ? filteredPath(an.rd, settledStays(packHolder, packLatest && packLatest.updated))
+  const v = posFilter ? filteredPath(an.rd, settledStays(packHolder, packLatest && packLatest.updated,
+                                                        isMoving(packHolder)))
                       : rawPath(an.rd.filter(p => p.src === "g"));
   packPathV = v.length >= 2 ? v : null;
   const { solid, dotted } = packPathV ? splitRuns(packPathV) : { solid: [], dotted: [] };
@@ -1711,6 +1802,7 @@ async function loadPackTrack() {
     const d = await getJSON(`/packs/${encodeURIComponent(PACK)}/track?range=${range}`);
     if (`${PACK}|${range}` !== key) return;        // pack or range changed meanwhile
     packTrack = d; packTrackKey = key; packTrackAt = Date.now();
+    dropHeldLive(packHolder, d);
     drawPackTrail();
   } catch (e) {
     // not entitled to 'location', or a Lambda without /track: the chart
@@ -1765,7 +1857,10 @@ async function pool(thunks, width) {
 async function pollLatest() {
   if (!auth || view !== "pack") return;
   try {
-    const d = await getJSON(latestPath(PACK));
+    const pid = PACK;
+    const d = await getJSON(latestPath(pid));
+    if (pid !== PACK) return;               // another pack was opened meanwhile
+    takeLatest(packHolder, d, packTrackBase(), Date.now() / 1000 - RANGE_S[range]);
     const t = withCells(d.telemetry || {});
     $("pid").textContent = d.pack_id || PACK;
     lastUpdatedTs = d.updated_ts || null;
@@ -1820,7 +1915,7 @@ function parkedNowPack() {
   const an = packHolder.an;
   if (!posFilter || !an) return null;
   const l = packLatest && packPosition(packLatest.t, packLatest.tts || {}, packLatest.updated);
-  return parkedNow(an.rd, settledStays(packHolder, packLatest && packLatest.updated),
+  return parkedNow(an.rd, settledStays(packHolder, packLatest && packLatest.updated, isMoving(packHolder)),
                    l && l.t ? { lat: l.lat, lon: l.lon, t: l.t } : null);
 }
 function drawPackPosition() {
@@ -2264,19 +2359,21 @@ function slotShown(s) {
   const p = s.pos;
   if (!p) return null;
   if (!posFilter || !s.track) return { ...p, parked: null };
-  const an = analyse(s, s.track);
-  const st = parkedNow(an.rd, settledStays(s, s.d && s.d.updated_ts),
+  const an = analyse(s, withLive(s, s.track));
+  const st = parkedNow(an.rd, settledStays(s, s.d && s.d.updated_ts, isMoving(s)),
                        p.t ? { lat: p.lat, lon: p.lon, t: p.t } : null);
   if (!st) return { ...p, parked: null };
   return { kind: st.src === "g" ? "gnss" : "net", lat: st.lat, lon: st.lon, acc: st.acc,
            src: p.src, t: st.t1, current: true, parked: st };
 }
 // The path over the last 24 h (filtered: a stay is one vertex; raw: every
-// reading), ending at the marker.
+// reading) with every /latest position since the /track read, ending at the
+// marker.
 function slotPath(s) {
   if (!s.track) return null;
-  const an = analyse(s, s.track), since = Date.now() / 1000 - RANGE_S[TRAIL_RANGE];
-  const v = (posFilter ? filteredPath(an.rd, settledStays(s, s.d && s.d.updated_ts)) : rawPath(an.rd))
+  const an = analyse(s, withLive(s, s.track)), since = Date.now() / 1000 - RANGE_S[TRAIL_RANGE];
+  const v = (posFilter ? filteredPath(an.rd, settledStays(s, s.d && s.d.updated_ts, isMoving(s)))
+                       : rawPath(an.rd))
     .filter(x => x.tEnd >= since);
   const sh = slotShown(s), p = s.pos;
   if (sh && !sh.parked && p?.t && p.t >= since && (!v.length || p.t > v.at(-1).tEnd)) {
@@ -2371,7 +2468,8 @@ function saveFleet() {
 function makeSlot(i) {
   const s = { i, pid: "", d: null, err: "", seen: undefined, pos: null, marker: null,
               sparkAt: 0, faults: null, faultsAt: 0, faultsOk: true,
-              track: null, trackAt: 0, trackOk: true, path: null, anTrack: null, an: null, el: {} };
+              track: null, trackAt: 0, trackOk: true, path: null, anTrack: null, an: null,
+              live: [], ups: [], el: {} };
   const e = s.el, mk = (tag, cls, parent) => {
     const x = document.createElement(tag);
     if (cls) x.className = cls;
@@ -2422,7 +2520,8 @@ function setSlotPack(s, pid) {
   if (s.pid === pid) return;
   Object.assign(s, { pid, d: null, err: "", seen: undefined, pos: null, marker: null,
                      sparkAt: 0, faults: null, faultsAt: 0, faultsOk: true,
-                     track: null, trackAt: 0, trackOk: true, path: null, anTrack: null, an: null });
+                     track: null, trackAt: 0, trackOk: true, path: null, anTrack: null, an: null,
+                     live: [], ups: [] });
   s.el.sel.value = pid;
   s.spark.set(null);
   renderSlot(s);
@@ -2498,7 +2597,7 @@ function renderSlot(s) {
   if (has && s.pid && !(s.pos && s.pos.current)) {
     // no position with the newest sample: the newest known (this pack's 24 h
     // path, else the 30-day lookup)
-    const r = s.track ? analyse(s, s.track).rd.at(-1) : null;
+    const r = s.track ? analyse(s, withLive(s, s.track)).rd.at(-1) : null;
     s.pos = newestPos(s.pos, readingPos(r, upd)) ||
             lastPos30(s.pid, () => { if (view === "fleet") { renderSlot(s); renderFleetMap(); } });
   }
@@ -2647,6 +2746,7 @@ async function refreshFleet() {
         jobs.push(() => getJSON(latestPath(pid)).then(d => {
           if (s.pid !== pid) return;        // the card was re-pointed meanwhile
           Object.assign(s, { d, seen, err: "" });
+          takeLatest(s, d, s.track, Date.now() / 1000 - RANGE_S[TRAIL_RANGE]);
         }).catch(e => { if (s.pid === pid) s.err = e.message; }));
       }
       if (now - s.sparkAt > FLEET_SLOW_MS) {
@@ -2666,6 +2766,7 @@ async function refreshFleet() {
           if (s.pid !== pid) return;
           s.trackAt = Date.now();
           s.track = d;
+          dropHeldLive(s, d);
         }).catch(e => {
           if (s.pid !== pid) return;
           if (String(e.message).startsWith("403")) s.trackOk = false;   // no 'location' group

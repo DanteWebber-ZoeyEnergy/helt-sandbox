@@ -629,6 +629,32 @@ that keeps repeating an old network position (it did for ~1.5 h, ages up to
 3.6 h) still looks parked there -- adding net_age_s to /track (query Lambda)
 would let the dashboard date those by measurement time.
 
+**Done (2026-10-07): the map path follows every poll (dashboard only).** Both
+maps add each `/latest` poll's position (the GNSS fix and/or the network
+position, at its `telemetry_ts`) to the path readings after the newest one
+`/track` holds (`mergeLive`), until the next `/track` re-read (2 min pack view,
+5 min fleet) replaces them -- so the path runs up to the marker after every
+poll. Before, it lagged 2-5 min: the fleet bridged the gap with a straight
+line (up to 7.4 km on HELT-0002's 2026-10-02 morning drive), the pack view
+left the marker off the path's end. The filter still applies; one rule
+changed so the marker and the path agree: the newest readings outside the
+last stay end it at once only while the pack uploads at its moving rate (two
+`/latest` `updated_ts` 90 s or less apart, the newest 90 s old at most --
+`fastUploads`; firmware 10 s moving vs 300 s parked), else after LEAVE_S as
+before. A parked pack's stray fix > 250 m no longer moves the marker (it did,
+for up to a batch period). No API change, no extra queries. Checked: the
+2026-10-01 night replayed poll by poll (5-min batches emulated) through the
+page's own code, old and new identical -- HELT-0002 4 m, HELT-0003 5 m median
+(10 m worst), HELT-0001 9 m from the ground truth, no overnight path at any of
+~3,800 polls; HELT-0002's drive: the path ends at the marker at every poll,
+longest step 970 m (one 30 s poll at speed) against the old 7.4 km line;
+previewed against `helt_prod` in both views and at phone width, with a
+simulated drive. Costed the same day (per tab left open 24/7, list prices):
+~$53/month fleet, ~$47 pack view, ~$1.30/month for the three packs' own
+pipeline; polling `/latest` every 10 s while a pack moves would add ~$6.60
+and needs the query Lambda's `/latest` cache cut to ~8 s for moving packs
+(not done). Still open: `/track` lacks `net_age_s`.
+
 **Next for the real pack:** the firmware repo's open issue on the internal-RAM
 budget with Wi-Fi up (instrument the boot, trim the Wi-Fi buffer pools, LVGL
 allocation audit) is the one thing 7C surfaced that is not fixed -- it is a
