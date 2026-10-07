@@ -315,6 +315,10 @@
              padding: .3rem .8rem; cursor: pointer; }
   .signout:hover { color: var(--red-dk); border-color: var(--red); }
   .whoami { font-size: .8rem; color: var(--muted); }
+  /* live push on (internal accounts): each upload shows as the pack sends it */
+  .livebadge { display: inline-flex; align-items: center; gap: .35rem;
+               font-size: .8rem; color: var(--ink-2); }
+  .livebadge .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--green); }
 
   .err { color: var(--red-dk); font-size: .85rem; margin-top: 1rem; min-height: 1.2em; }
   footer { max-width: 2400px; margin: 0 auto; padding: 0 1.5rem 2rem;
@@ -398,6 +402,8 @@
   <select class="packsel packonly" id="packSel" aria-label="Select pack"></select>
   <span class="pill packonly" id="packPill"><span class="dot"></span><span id="pid">—</span>&nbsp;<span id="stateTxt">connecting…</span><span id="sysState"></span></span>
   <span class="updated packonly" id="age">updated: never</span>
+  <span class="livebadge" id="liveBadge" hidden
+        title="Live: each upload shows as soon as the pack sends it, no polling"><span class="dot"></span>Live</span>
   <span class="whoami" id="whoami"></span>
   <button class="signout" id="signout" hidden>Sign out</button>
 </header>
@@ -472,7 +478,7 @@
   <div class="controls">
     <h2>History</h2>
     <div class="seg" id="rangeSeg" role="group" aria-label="Time range"></div>
-    <span class="updated">auto-refreshes every 30 s</span>
+    <span class="updated" id="histNote">auto-refreshes every 30 s</span>
   </div>
 
   <section class="charts" id="charts"></section>
@@ -548,6 +554,7 @@ async function login(email, password) {
   const r = d.AuthenticationResult;
   saveAuth({ access: r.AccessToken, refresh: r.RefreshToken,
              exp: Date.now() + r.ExpiresIn * 1000, email });
+  liveStop();                             // a new account: its own live answer
 }
 let refreshing = null;                    // single-flight: pollers share one refresh
 function refreshAuth() {
@@ -569,6 +576,7 @@ async function token() {
 async function signOut(localOnly) {
   const a = auth;
   saveAuth(null);
+  liveStop();
   showLogin();
   if (!localOnly && a) {                  // best-effort server-side revoke
     try { await idp("GlobalSignOut", { AccessToken: a.access }); } catch {}
@@ -583,7 +591,7 @@ function startData() {
   $("login").hidden = true;
   $("signout").hidden = false;
   $("whoami").textContent = auth.email || "";
-  loadPacks().then(route);
+  loadPacks().then(route).then(liveStart);
 }
 // Selected pack — populated from GET /packs, remembered per browser
 let PACK = localStorage.getItem("helt_pack") || "SANDBOX-01";
@@ -1553,6 +1561,144 @@ function fastUploads(seen, nowT) {
 }
 /* </position-filter> */
 
+/* <live-merge> -- pure functions (no DOM): what one pushed upload changes.
+   An upload is what the ingest Lambda wrote for one pack message
+   (publish_live): {pack_id, samples: [{ts, ts_synced, <field>: value}],
+   faults: [{t, src, code}]}. Each merge mirrors what the API would answer
+   after that write, so a pushed view shows what a polled one would. */
+const LATEST_WINDOW_S = 15 * 60;              // /latest's default lookback
+// the query Lambda's RANGES windows and AGG_FN (keep them equal)
+const RANGE_EVERY = { "15m": 0, "1h": 15, "6h": 120, "24h": 300, "7d": 1800 };
+const AGG_FN = { ac_surge_count: "sum", fault_count: "sum", ac_surge_max_w: "max",
+                 si_state: "last", bms_state: "last", net_src: "last" };
+// a sample's fields as the API serves them: no ts / tag, no 0 GNSS
+// coordinate (the API drops those before any read: DROP_NULL_ISLAND)
+function sampleFields(s) {
+  const out = {};
+  for (const k in s) {
+    const v = s[k];
+    if (k === "ts" || k === "ts_synced" || typeof v !== "number") continue;
+    if ((k === "lat" || k === "lon") && v === 0) continue;
+    out[k] = v;
+  }
+  return out;
+}
+// /latest's answer (d, or null) after an upload: each field's newest value and
+// when it was reported; a field not reported in the 15 min before the newest
+// reading drops out, as it does from /latest's default window.
+function mergeLatest(d, up) {
+  const tel = { ...(d?.telemetry || {}) }, tts = { ...(d?.telemetry_ts || {}) };
+  let upd = d?.updated_ts || 0;
+  for (const s of up.samples || []) {
+    const f = sampleFields(s);
+    for (const k in f) if (s.ts >= (tts[k] || 0)) { tel[k] = f[k]; tts[k] = s.ts; }
+    upd = Math.max(upd, s.ts);
+  }
+  for (const k in tts) if (tts[k] < upd - LATEST_WINDOW_S) { delete tel[k]; delete tts[k]; }
+  return { ...(d || {}), pack_id: up.pack_id, updated_ts: upd, telemetry: tel, telemetry_ts: tts };
+}
+// the newest reading time in an upload (0 for none)
+const uploadEnd = up => (up.samples || []).reduce((a, s) => Math.max(a, s.ts || 0), 0);
+// its positions for the map path, as /track has them: no pre-SNTP samples,
+// none more than a minute ahead of nowT
+function pushedReadings(up, nowT) {
+  const out = [];
+  for (const s of up.samples || []) {
+    if (!s.ts_synced || s.ts > nowT + 60) continue;
+    const f = sampleFields(s);
+    if (f.lat != null && f.lon != null) out.push({ t: s.ts, lat: f.lat, lon: f.lon, acc: 0, src: "g" });
+    if (f.net_lat != null && f.net_lon != null) {
+      out.push({ t: s.ts, lat: f.net_lat, lon: f.net_lon, acc: f.net_acc_m ?? 0, src: "n" });
+    }
+  }
+  return out.sort((a, b) => a.t - b.t);
+}
+// every field's pushed samples, time order, one per time (a re-delivered or
+// re-applied upload counts once -- InfluxDB keeps one point per time too)
+function samplesByField(ups) {
+  const by = {};
+  for (const up of ups) for (const s of up.samples || []) {
+    const f = sampleFields(s);
+    for (const k in f) (by[k] ||= new Map()).set(s.ts, f[k]);
+  }
+  const out = {};
+  for (const k in by) out[k] = [...by[k]].map(([t, v]) => ({ t, v })).sort((a, b) => a.t - b.t);
+  return out;
+}
+// The uploads an answer cannot hold: those whose newest reading is later than
+// the answer's newest point (the read's time, while a window was open). An
+// upload is stored whole, so it is in an answer entirely or not at all --
+// a parked pack's 5-min batch reaches back before the read, yet is new.
+function freshUploads(ups, series) {
+  let cut = -Infinity;
+  for (const k in series || {}) cut = Math.max(cut, series[k].at(-1)?.t ?? -Infinity);
+  return ups.filter(u => uploadEnd(u) > cut);
+}
+// One field's series as the API answered it (srv, time order) with pushed
+// samples (time order, none of them in srv) added on the range's windows: raw
+// for 15m; else one point per epoch-aligned window, aggregated with fn and
+// labelled at the window's end (nowT while it is still open, as the API labels
+// its last one). A window the API already has a point in combines both: sums
+// add, peaks take the max, a state the newer; a mean weights the API's part by
+// the readings it likely held (its share of the window at the pushed samples'
+// cadence). Points before t0 drop.
+function mergeSeries(srv, pts, every, fn, nowT, t0) {
+  const out = srv.slice();
+  if (!every) {
+    const have = new Set(srv.map(p => p.t));
+    for (const p of pts) if (!have.has(p.t)) out.push({ t: p.t, v: p.v });
+  } else if (pts.length) {
+    const wins = new Map();
+    for (const p of pts) {
+      const s = Math.floor(p.t / every) * every;
+      let w = wins.get(s);
+      if (!w) wins.set(s, w = { s, n: 0, sum: 0, max: -Infinity, last: null, lastT: -Infinity });
+      w.n++; w.sum += p.v;
+      if (p.v > w.max) w.max = p.v;
+      if (p.t >= w.lastT) { w.last = p.v; w.lastT = p.t; }
+    }
+    const gaps = pts.slice(1).map((p, i) => p.t - pts[i].t).filter(g => g > 0);
+    const cadence = gaps.length ? medianOf(gaps) : 30;
+    const at = new Map(out.map((p, i) => [Math.ceil(p.t / every) * every - every, i]));  // window start -> API point
+    for (const w of wins.values()) {
+      const label = Math.max(Math.min(w.s + every, Math.floor(nowT)), w.lastT, w.s + 1);   // in (s, s + every]
+      let v = fn === "sum" ? w.sum : fn === "max" ? w.max : fn === "last" ? w.last : w.sum / w.n;
+      const i = at.get(w.s);
+      if (i == null) { out.push({ t: label, v }); continue; }
+      const api = out[i];
+      const nApi = Math.max(1, Math.round((api.t - w.s) / cadence));
+      v = fn === "sum" ? api.v + w.sum : fn === "max" ? Math.max(api.v, w.max)
+        : fn === "last" ? (w.lastT >= api.t ? w.last : api.v) : (api.v * nApi + w.sum) / (nApi + w.n);
+      out[i] = { t: Math.max(label, api.t), v };
+    }
+  }
+  return out.sort((a, b) => a.t - b.t).filter(p => p.t >= t0);
+}
+// every field: the API's series ({field: [{t, v}]}) with the uploads it
+// cannot hold merged in
+function mergeAll(series, ups, every, nowT, t0) {
+  const by = samplesByField(freshUploads(ups, series)), out = {};
+  for (const k of new Set([...Object.keys(series || {}), ...Object.keys(by)])) {
+    const m = mergeSeries((series || {})[k] || [], by[k] || [], every, AGG_FN[k] || "mean", nowT, t0);
+    if (m.length) out[k] = m;
+  }
+  return out;
+}
+// /faults rows with the uploads' faults: newest first, each once (one point
+// per code and second, as stored), none before t0, at most cap
+function mergeFaults(rows, ups, t0, cap) {
+  const all = [...(rows || []), ...ups.flatMap(u => u.faults || [])].sort((a, b) => b.t - a.t);
+  const seen = new Set(), out = [];
+  for (const f of all) {
+    const k = `${f.t}|${f.code}`;
+    if (f.t < t0 || seen.has(k)) continue;
+    seen.add(k); out.push(f);
+    if (out.length >= cap) break;
+  }
+  return out;
+}
+/* </live-merge> */
+
 
 // Filtering on (the default) or off (every reading as it came in): one
 // setting for both maps, kept per browser.
@@ -1854,51 +2000,286 @@ async function pool(thunks, width) {
   }));
 }
 
+/* ---------------- live push (internal accounts only, "H") ----------------
+   Each upload is pushed the moment the ingest Lambda has stored it: AppSync
+   Events API `helt-live`, one channel per pack (/packs/<pack_id>), subscribed
+   for the packs the shown view needs. Only internal accounts (the '*' ALL row
+   in helt_entitlements) may subscribe -- the namespace's onSubscribe handler
+   checks; a customer's dashboard is refused once and polls for the rest of
+   the tab session, exactly as before. While a pack is live its view polls
+   nothing and applies each upload as the next poll would have (<live-merge>);
+   on (re)subscribing, and every LIVE_RESYNC_MS, the view re-reads that pack
+   once (the stretch it may have missed). Any failure falls back to polling
+   at once and reconnects with backoff. */
+const EVENTS_HTTP = "jjbf7xxayfbcbezpv3gjb7npuy.appsync-api.us-east-1.amazonaws.com";
+const EVENTS_RT   = "jjbf7xxayfbcbezpv3gjb7npuy.appsync-realtime-api.us-east-1.amazonaws.com";
+const LIVE_RESYNC_MS = 6 * 3600 * 1000;            // a live view is re-read this often anyway
+const LIVE_KEEP_S = LIVE_RESYNC_MS / 1000 + 900;   // pushed uploads kept to merge into answers
+const LIVE_ROTATE_MS = 23 * 3600 * 1000;           // AppSync ends a connection at 24 h
+const LIVE_TOKEN_MARGIN_MS = 3 * 60 * 1000;        // ... and one is replaced before its token expires
+const CHANNEL_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,48}[A-Za-z0-9])?$/;
+const live = {
+  // conn: the connection in use { ws, up, kaAt, kaMs, at, subs: pid -> {id, on},
+  // ids: id -> pid }; next: its replacement while rotating (subscribed before
+  // the old one closes, so nothing is missed)
+  conn: null, next: null, timer: 0, tries: 0, seq: 0,
+  buf: new Map(),          // pack_id -> [{at, up}]: the uploads pushed in the last LIVE_KEEP_S
+  syncAt: new Map(),       // pack_id -> when its view was last re-read while live
+  internal: false,         // a subscription was accepted: an internal account
+  denied: (() => { try { return sessionStorage.getItem("helt_live") === "denied"; } catch { return false; } })(),
+};
+const livePack = pid => !!live.conn?.subs.get(pid)?.on;
+const liveUploads = pid => (live.buf.get(pid) || []).map(e => e.up);
+function liveWanted() {
+  const ids = view === "pack" ? [PACK] : slots.map(s => s.pid);
+  return [...new Set(ids.filter(pid => pid && CHANNEL_RE.test(pid)))];
+}
+function liveBadge() {
+  $("liveBadge").hidden = !liveWanted().some(livePack);
+  $("histNote").textContent = livePack(PACK) ? "live updates" : "auto-refreshes every 30 s";
+}
+
+function liveStart() {
+  if (auth && !live.denied && !live.conn) liveConnect(false);
+}
+// open a connection (rotating: as live.next, beside the one in use)
+async function liveConnect(rotating) {
+  clearTimeout(live.timer);
+  let tok;
+  try { tok = await token(); } catch { return; }
+  if (!auth || live.denied || (rotating ? live.next : live.conn)) return;
+  const hdr = btoa(JSON.stringify({ host: EVENTS_HTTP, Authorization: tok }))
+    .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  const c = { ws: null, up: false, kaAt: Date.now(), kaMs: 300000, at: Date.now(),
+              tokExp: auth.exp, subs: new Map(), ids: new Map() };
+  try {
+    c.ws = new WebSocket(`wss://${EVENTS_RT}/event/realtime`, ["aws-appsync-event-ws", `header-${hdr}`]);
+  } catch (e) {
+    console.warn("live:", e);
+    if (!rotating) liveRetry();
+    return;
+  }
+  if (rotating) live.next = c; else live.conn = c;
+  c.ws.onopen = () => c.ws.send(JSON.stringify({ type: "connection_init" }));
+  c.ws.onmessage = e => { try { liveMessage(c, e.data); } catch (err) { console.warn("live:", err); } };
+  c.ws.onclose = () => liveClosed(c);
+}
+function liveMessage(c, raw) {
+  if (c.dead) return;
+  const m = JSON.parse(raw);
+  c.kaAt = Date.now();                       // any frame (and "ka" every minute) = link alive
+  const pid = m.id ? c.ids.get(m.id) : null;
+  switch (m.type) {
+    case "connection_ack":
+      c.up = true;
+      c.kaMs = m.connectionTimeoutMs || 300000;
+      liveSubscribe(c);
+      return;
+    case "subscribe_success":
+      if (!pid) return;
+      c.subs.get(pid).on = true;
+      live.internal = true;
+      live.tries = 0;
+      if (c === live.conn) { liveResync(pid); liveBadge(); }
+      else if (c === live.next) liveSwapWhenReady();
+      return;
+    case "subscribe_error":
+      // refused: not an internal account -- poll as before, ask no more
+      if ((m.errors || []).some(e => /unauthori[sz]ed/i.test(`${e.errorType} ${e.message}`))) return liveDeny();
+      return liveDrop(c);
+    case "data": {
+      const up = typeof m.event === "string" ? JSON.parse(m.event) : m.event;
+      if (pid && up && up.pack_id === pid) livePush(pid, up);
+      return;
+    }
+    case "broadcast_error":                  // an upload was lost on its way: re-read
+      if (pid && c === live.conn) liveResync(pid);
+      return;
+    case "connection_error":
+    case "error":
+      return liveDrop(c);
+  }
+}
+// subscriptions on c = the packs the view needs (the rest unsubscribed)
+async function liveSubscribe(c) {
+  if (!c || !c.up) return;
+  let tok;
+  try { tok = await token(); } catch { return; }
+  if (c.dead || c.ws.readyState !== 1) return;
+  const want = new Set(liveWanted());
+  for (const [pid, sub] of c.subs) {
+    if (want.has(pid)) continue;
+    c.ws.send(JSON.stringify({ type: "unsubscribe", id: sub.id }));
+    c.subs.delete(pid); c.ids.delete(sub.id);
+  }
+  for (const pid of want) {
+    if (c.subs.has(pid)) continue;
+    const id = `p${++live.seq}`;
+    c.subs.set(pid, { id, on: false }); c.ids.set(id, pid);
+    c.ws.send(JSON.stringify({ type: "subscribe", id, channel: `/packs/${pid}`,
+                               authorization: { host: EVENTS_HTTP, Authorization: tok } }));
+  }
+  for (const pid of [...live.buf.keys()]) if (!want.has(pid)) live.buf.delete(pid);
+  if (c === live.next) liveSwapWhenReady();
+  liveBadge();
+}
+// rotation: once the new connection carries every subscription, it takes over
+// and the old one closes -- no gap, so nothing to re-read (a pack that only
+// the new one carries is re-read)
+function liveSwapWhenReady() {
+  const n = live.next;
+  if (!n || ![...n.subs.values()].every(x => x.on)) return;
+  const old = live.conn;
+  live.conn = n; live.next = null;
+  if (old) { old.dead = true; try { old.ws.close(); } catch {} }
+  for (const [pid, x] of n.subs) if (x.on && !old?.subs.get(pid)?.on) liveResync(pid);
+  liveBadge();
+}
+function liveClosed(c) {
+  if (c.dead) return;                        // replaced or dropped on purpose
+  c.dead = true;
+  if (c === live.next) { live.next = null; return; }   // the old one carries on
+  if (c !== live.conn) return;
+  const was = [...c.subs.values()].some(x => x.on);
+  live.conn = null;
+  if (live.next) { live.next.dead = true; try { live.next.ws.close(); } catch {} live.next = null; }
+  liveBadge();
+  if (!auth || live.denied) return;
+  if (was) { if (view === "pack") { pollLatest(); refreshHistory(); } else refreshFleet(); }  // polling, at once
+  liveRetry();
+}
+function liveDrop(c) { try { c.ws.close(); } catch { liveClosed(c); } }
+// reconnect after 1, 2, 4 .. 60 s (jittered); reset by a subscription accepted
+function liveRetry() {
+  clearTimeout(live.timer);
+  const ms = Math.min(60000, 1000 * 2 ** live.tries++) * (0.5 + Math.random() / 2);
+  live.timer = setTimeout(() => liveConnect(false), ms);
+}
+function liveDeny() {
+  live.denied = true;
+  try { sessionStorage.setItem("helt_live", "denied"); } catch {}
+  for (const c of [live.conn, live.next]) if (c) { c.dead = true; try { c.ws.close(); } catch {} }
+  live.conn = live.next = null;
+  live.buf.clear();
+  liveBadge();
+}
+// sign-out: everything off, and the next account gets its own answer
+function liveStop() {
+  clearTimeout(live.timer);
+  for (const c of [live.conn, live.next]) if (c) { c.dead = true; try { c.ws.close(); } catch {} }
+  Object.assign(live, { conn: null, next: null, tries: 0, internal: false, denied: false });
+  live.buf.clear(); live.syncAt.clear();
+  try { sessionStorage.removeItem("helt_live"); } catch {}
+  liveBadge();
+}
+// re-read a live pack's view once (as polling would): the stretch before its
+// subscription, or a periodic check
+function liveResync(pid) {
+  live.syncAt.set(pid, Date.now());
+  if (view === "pack" && pid === PACK) { packTrackAt = 0; pollLatest(); refreshHistory(); }
+  if (view === "fleet") {
+    for (const s of slots) if (s.pid === pid) s.resync = true;
+    refreshFleet();
+  }
+}
+// a view is shown: it re-reads (as without live); subscriptions follow it
+function liveView() {
+  for (const pid of liveWanted()) {
+    if (!livePack(pid)) continue;
+    live.syncAt.set(pid, Date.now());
+    if (view === "pack") packTrackAt = 0;
+    else for (const s of slots) if (s.pid === pid) s.resync = true;
+  }
+  liveSubscribe(live.conn);
+  liveSubscribe(live.next);
+  liveBadge();
+}
+// one upload, pushed: keep it (later answers merge it in), then show it
+function livePush(pid, up) {
+  const now = Date.now() / 1000, b = live.buf.get(pid) || [];
+  b.push({ at: now, up });
+  while (b.length && b[0].at < now - LIVE_KEEP_S) b.shift();
+  live.buf.set(pid, b);
+  const p = packInfo(pid), end = uploadEnd(up);
+  if (p && end > (p.last_seen || 0)) { p.last_seen = end; p.online = true; }
+  if (view === "pack" && pid === PACK) {
+    takePush(packHolder, up, packTrackBase(), now - RANGE_S[range]);
+    if (packD) applyLatest(mergeLatest(packD, up));
+    renderHistory();
+    renderFaults();
+  }
+  if (view === "fleet") {
+    for (const s of slots) {
+      if (s.pid !== pid) continue;
+      takePush(s, up, s.track, now - RANGE_S[TRAIL_RANGE]);
+      if (s.d) { s.d = mergeLatest(s.d, up); s.err = ""; }
+      renderSpark(s);
+      slotFaults(s);
+      renderSlot(s);
+    }
+    renderFleetMap();
+  }
+}
+// an upload's time and positions into a path holder (as takeLatest does for
+// a /latest answer): every reading of the upload, not only its newest
+function takePush(holder, up, track, since) {
+  holder.ups = noteUpload(holder.ups || [], uploadEnd(up));
+  const rs = pushedReadings(up, Date.now() / 1000).filter(r => r.t >= since);
+  holder.live = addLive(holder.live || [], rs, trackEnd(track));
+}
+
 async function pollLatest() {
   if (!auth || view !== "pack") return;
   try {
     const pid = PACK;
     const d = await getJSON(latestPath(pid));
     if (pid !== PACK) return;               // another pack was opened meanwhile
-    takeLatest(packHolder, d, packTrackBase(), Date.now() / 1000 - RANGE_S[range]);
-    const t = withCells(d.telemetry || {});
-    $("pid").textContent = d.pack_id || PACK;
-    lastUpdatedTs = d.updated_ts || null;
-    renderAge();
-
-    latestT = t;
-    const tts = d.telemetry_ts || null;     // per-field times (absent on an old Lambda)
-    $("sysState").textContent = t.bms_state != null && STATE_NAMES[t.bms_state]
-      ? ` · ${STATE_NAMES[t.bms_state]}` : "";
-
-    $("k_soc").textContent = fmt(t.soc_pct, 0);
-    $("socMeter").style.width = `${Math.min(100, Math.max(0, t.soc_pct ?? 0))}%`;
-    const { w: netW, avg } = netPower(t);
-    $("k_power").textContent = fmt(netW, 0);
-    $("k_powerNote").textContent = flowText(netW) + (avg ? " · 30 s avg" : "");
-    $("k_soh").textContent = fmt(t.soh_pct, 1);
-    $("k_sohNote").textContent = t.max_cell_temp_c != null
-      ? `max cell ${fmt(t.max_cell_temp_c, 1)} °C` : "";
-    $("k_cycles").textContent = t.cycle_count ?? "–";
-
-    for (const f of FIELDS) {
-      if (f.dots) continue;                 // its header is the count in range
-      const n = $(`now_${f.key}`);
-      n.replaceChildren();
-      n.append(fmt(t[f.key], f.dec));
-      const u = document.createElement("span");
-      u.className = "unit"; u.textContent = ` ${f.unit}`;
-      n.appendChild(u);
-    }
-    for (const m of MULTI) multis[m.id].setNow(t);
-    cellStrip.setLatest(t, tts);
-    syncCards();
-    renderPosition(t, tts, d.updated_ts);
-    setErr("latest", "");
+    // uploads pushed meanwhile (live): a newer value wins, an older changes nothing
+    applyLatest(liveUploads(pid).reduce(mergeLatest, d));
   } catch (e) {
     setErr("latest", "⚠ " + e.message +
       "  (check the API constant, and that fake_pack.py is publishing)");
   }
+}
+// A /latest answer (polled, or with pushed uploads merged in) onto the page.
+let packD = null;                           // the newest of those, shown pack
+function applyLatest(d) {
+  packD = d;
+  takeLatest(packHolder, d, packTrackBase(), Date.now() / 1000 - RANGE_S[range]);
+  const t = withCells(d.telemetry || {});
+  $("pid").textContent = d.pack_id || PACK;
+  lastUpdatedTs = d.updated_ts || null;
+  renderAge();
+
+  latestT = t;
+  const tts = d.telemetry_ts || null;     // per-field times (absent on an old Lambda)
+  $("sysState").textContent = t.bms_state != null && STATE_NAMES[t.bms_state]
+    ? ` · ${STATE_NAMES[t.bms_state]}` : "";
+
+  $("k_soc").textContent = fmt(t.soc_pct, 0);
+  $("socMeter").style.width = `${Math.min(100, Math.max(0, t.soc_pct ?? 0))}%`;
+  const { w: netW, avg } = netPower(t);
+  $("k_power").textContent = fmt(netW, 0);
+  $("k_powerNote").textContent = flowText(netW) + (avg ? " · 30 s avg" : "");
+  $("k_soh").textContent = fmt(t.soh_pct, 1);
+  $("k_sohNote").textContent = t.max_cell_temp_c != null
+    ? `max cell ${fmt(t.max_cell_temp_c, 1)} °C` : "";
+  $("k_cycles").textContent = t.cycle_count ?? "–";
+
+  for (const f of FIELDS) {
+    if (f.dots) continue;                 // its header is the count in range
+    const n = $(`now_${f.key}`);
+    n.replaceChildren();
+    n.append(fmt(t[f.key], f.dec));
+    const u = document.createElement("span");
+    u.className = "unit"; u.textContent = ` ${f.unit}`;
+    n.appendChild(u);
+  }
+  for (const m of MULTI) multis[m.id].setNow(t);
+  cellStrip.setLatest(t, tts);
+  syncCards();
+  renderPosition(t, tts, d.updated_ts);
+  setErr("latest", "");
 }
 
 // Where is the pack now? The GNSS fix (red) and/or the network position
@@ -2072,34 +2453,54 @@ function applyBundle(series) {
 }
 
 // Faults ('ops'): a list, not a chart -- each row is one fault as raised.
+let faultRows = null, faultKey = "";        // the last /faults answer
 async function loadFaults() {
   if (!faultsAllowed) return;
   try {
+    const key = `${PACK}|${range}`;
     const d = await getJSON(`/packs/${PACK}/faults?range=${range}`);
-    const rows = d.faults || [];
-    faultCard.hidden = false;
-    $("now_faults").textContent = `${rows.length}${rows.length >= 200 ? "+" : ""} in range`;
-    faultList.replaceChildren(...(rows.length ? rows.map(f => {
-      const li = document.createElement("li");
-      const when = document.createElement("span");
-      when.className = "when";
-      when.textContent = new Date(f.t * 1000).toLocaleString([],
-        { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit" });
-      const src = document.createElement("span");
-      src.className = "src"; src.textContent = f.src;
-      const what = document.createElement("span");
-      what.className = "what";
-      const c = document.createElement("code"); c.textContent = f.code;
-      what.append(c, FAULT_NAMES[parseInt(f.code, 16)] || "Unknown fault");
-      li.append(when, src, what);
-      return li;
-    }) : [Object.assign(document.createElement("li"),
-                        { className: "none", textContent: "No faults in this range" })]));
+    faultRows = d.faults || []; faultKey = key;
+    renderFaults();
   } catch (e) {
     if (String(e.message).startsWith("403")) { faultsAllowed = false; faultCard.hidden = true; }
     else if (String(e.message).includes("404")) { faultsAllowed = false; }   // Lambda predates /faults
     else console.warn("faults:", e);
   }
+}
+// the /faults rows with the faults pushed since (live), newest first
+function renderFaults() {
+  if (!faultRows || faultKey !== `${PACK}|${range}`) return;
+  const ups = liveUploads(PACK);
+  const rows = ups.length ? mergeFaults(faultRows, ups, Date.now() / 1000 - RANGE_S[range], FAULTS_SHOWN)
+                          : faultRows;
+  faultCard.hidden = false;
+  $("now_faults").textContent = `${rows.length}${rows.length >= 200 ? "+" : ""} in range`;
+  faultList.replaceChildren(...(rows.length ? rows.map(f => {
+    const li = document.createElement("li");
+    const when = document.createElement("span");
+    when.className = "when";
+    when.textContent = new Date(f.t * 1000).toLocaleString([],
+      { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit" });
+    const src = document.createElement("span");
+    src.className = "src"; src.textContent = f.src;
+    const what = document.createElement("span");
+    what.className = "what";
+    const c = document.createElement("code"); c.textContent = f.code;
+    what.append(c, FAULT_NAMES[parseInt(f.code, 16)] || "Unknown fault");
+    li.append(when, src, what);
+    return li;
+  }) : [Object.assign(document.createElement("li"),
+                      { className: "none", textContent: "No faults in this range" })]));
+}
+
+// The last /histories answer, drawn with the uploads pushed since (live): on
+// the range's windows, as the next answer would have them (mergeAll).
+let histRaw = null, histRawKey = "";
+function renderHistory() {
+  if (!histRaw || histRawKey !== `${PACK}|${range}`) return;
+  const ups = liveUploads(PACK), now = Date.now() / 1000;
+  applyBundle(ups.length ? mergeAll(histRaw, ups, RANGE_EVERY[range], now, now - RANGE_S[range])
+                         : histRaw);
 }
 
 async function refreshHistory() {
@@ -2113,8 +2514,10 @@ async function refreshHistory() {
     // query server-side — the query bill is the dominant cost)
     if (bundledApi) {
       try {
+        const key = `${PACK}|${range}`;
         const h = await getJSON(`/packs/${PACK}/histories?range=${range}`);
-        applyBundle(h.series || {});
+        histRaw = h.series || {}; histRawKey = key;
+        renderHistory();
         return;
       } catch (e) {
         if (String(e.message).includes("404")) { bundledApi = false; }  // old Lambda deployed
@@ -2146,8 +2549,10 @@ async function refreshHistory() {
   }
 }
 
+let packsAt = 0;
 async function loadPacks() {
   if (!auth) return;
+  packsAt = Date.now();
   try {
     const d = await getJSON("/packs");
     const packs = d.packs || [];
@@ -2191,6 +2596,7 @@ function selectPack(pid) {
   packMarks.clearLayers();
   packArrows.clearLayers();
   histTrack = { series: [], net: [] }; packPathV = null; packHolder = {}; packLatest = null;
+  packD = null; histRaw = null; faultRows = null;
   packTrack = null; packTrackKey = ""; packTrackOk = true;
   $("lgPath").hidden = true;
   $("lgPackParked").hidden = true;
@@ -2467,9 +2873,9 @@ function saveFleet() {
 
 function makeSlot(i) {
   const s = { i, pid: "", d: null, err: "", seen: undefined, pos: null, marker: null,
-              sparkAt: 0, faults: null, faultsAt: 0, faultsOk: true,
+              sparkAt: 0, sparkRaw: null, faults: null, faultsRaw: null, faultsAt: 0, faultsOk: true,
               track: null, trackAt: 0, trackOk: true, path: null, anTrack: null, an: null,
-              live: [], ups: [], el: {} };
+              live: [], ups: [], resync: false, el: {} };
   const e = s.el, mk = (tag, cls, parent) => {
     const x = document.createElement(tag);
     if (cls) x.className = cls;
@@ -2519,12 +2925,13 @@ for (let i = 0; i < FLEET_SLOTS; i++) slots.push(makeSlot(i));
 function setSlotPack(s, pid) {
   if (s.pid === pid) return;
   Object.assign(s, { pid, d: null, err: "", seen: undefined, pos: null, marker: null,
-                     sparkAt: 0, faults: null, faultsAt: 0, faultsOk: true,
+                     sparkAt: 0, sparkRaw: null, faults: null, faultsRaw: null, faultsAt: 0, faultsOk: true,
                      track: null, trackAt: 0, trackOk: true, path: null, anTrack: null, an: null,
-                     live: [], ups: [] });
+                     live: [], ups: [], resync: false });
   s.el.sel.value = pid;
   s.spark.set(null);
   renderSlot(s);
+  if (view === "fleet") liveSubscribe(live.conn);
 }
 
 // After every GET /packs: the card pickers' options, and which pack each card
@@ -2728,6 +3135,23 @@ function focusPack(s) {
   $("fleetMapCard").scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
 
+// A card's SoC trend and 24-h faults: the API's answers with the uploads
+// pushed since (live) merged in.
+function renderSpark(s) {
+  if (!s.sparkRaw) return;
+  const ups = liveUploads(s.pid), now = Date.now() / 1000;
+  const fresh = freshUploads(ups, { soc_pct: s.sparkRaw });
+  s.spark.set(fresh.length ? mergeSeries(s.sparkRaw, samplesByField(fresh).soc_pct || [], RANGE_EVERY["24h"],
+                                         "mean", now, now - RANGE_S["24h"])
+                           : s.sparkRaw);
+}
+function slotFaults(s) {
+  if (!s.faultsRaw) return;
+  const ups = liveUploads(s.pid);
+  s.faults = ups.length ? mergeFaults(s.faultsRaw, ups, Date.now() / 1000 - RANGE_S["24h"], FAULTS_SHOWN)
+                        : s.faultsRaw;
+}
+
 let fleetBusy = false, fleetAgain = false;
 async function refreshFleet() {
   if (!auth || view !== "fleet") return;
@@ -2738,22 +3162,28 @@ async function refreshFleet() {
     for (const s of slots) {
       const pid = s.pid;
       if (!pid) continue;
+      // live (pushed uploads): nothing to read, unless the card is due a
+      // re-read -- it just (re)subscribed, or LIVE_RESYNC_MS passed
+      const resync = s.resync;
+      if (livePack(pid) && !resync) continue;
+      s.resync = false;
       const enc = encodeURIComponent(pid), p = packInfo(pid);
       // latest: always for an online pack; an offline one only once, and
       // again when /packs shows it has reported since
-      if (!s.d || isOnline(p) || (p && p.last_seen !== s.seen)) {
+      if (resync || !s.d || isOnline(p) || (p && p.last_seen !== s.seen)) {
         const seen = p ? p.last_seen : undefined;
         jobs.push(() => getJSON(latestPath(pid)).then(d => {
           if (s.pid !== pid) return;        // the card was re-pointed meanwhile
-          Object.assign(s, { d, seen, err: "" });
-          takeLatest(s, d, s.track, Date.now() / 1000 - RANGE_S[TRAIL_RANGE]);
+          Object.assign(s, { d: liveUploads(pid).reduce(mergeLatest, d), seen, err: "" });
+          takeLatest(s, s.d, s.track, Date.now() / 1000 - RANGE_S[TRAIL_RANGE]);
         }).catch(e => { if (s.pid === pid) s.err = e.message; }));
       }
-      if (now - s.sparkAt > FLEET_SLOW_MS) {
+      if (resync || now - s.sparkAt > FLEET_SLOW_MS) {
         jobs.push(() => getJSON(`/packs/${enc}/history?field=soc_pct&range=24h`).then(h => {
           if (s.pid !== pid) return;
           s.sparkAt = Date.now();
-          s.spark.set(h.series || []);
+          s.sparkRaw = h.series || [];
+          renderSpark(s);
         }).catch(e => {
           console.warn(`soc trend ${pid}:`, e);
           if (s.pid === pid && String(e.message).startsWith("403")) {
@@ -2761,7 +3191,7 @@ async function refreshFleet() {
           }
         }));
       }
-      if (s.trackOk && now - s.trackAt > FLEET_SLOW_MS) {
+      if (s.trackOk && (resync || now - s.trackAt > FLEET_SLOW_MS)) {
         jobs.push(() => getJSON(`/packs/${enc}/track?range=${TRAIL_RANGE}`).then(d => {
           if (s.pid !== pid) return;
           s.trackAt = Date.now();
@@ -2773,11 +3203,12 @@ async function refreshFleet() {
           else console.warn(`track ${pid}:`, e);
         }));
       }
-      if (s.faultsOk && now - s.faultsAt > FLEET_SLOW_MS) {
+      if (s.faultsOk && (resync || now - s.faultsAt > FLEET_SLOW_MS)) {
         jobs.push(() => getJSON(`/packs/${enc}/faults?range=24h`).then(d => {
           if (s.pid !== pid) return;
           s.faultsAt = Date.now();
-          s.faults = d.faults || [];
+          s.faultsRaw = d.faults || [];
+          slotFaults(s);
         }).catch(e => {
           if (s.pid !== pid) return;
           // not entitled ('ops' only), or a Lambda without /faults: no row
@@ -2842,6 +3273,7 @@ function showView(v, fetch = true) {
   document.body.dataset.view = v;
   for (const b of $("viewSeg").children) b.classList.toggle("on", b.dataset.v === v);
   if (!fetch) return;
+  liveView();
   if (v === "pack") {
     setTimeout(() => map.invalidateSize(), 0);   // Leaflet re-measures once shown
     pollLatest();
@@ -2894,10 +3326,27 @@ if (auth) startData(); else showLogin();
 // cache — faster polling only re-reads the same cached answer (see
 // API_SECURITY_SPEC.md §5); the 1 s ticker keeps the age displays live.
 // All pollers no-op while signed out, and each view's only while it shows.
-setInterval(pollLatest, 30000);
-setInterval(refreshHistory, 30000);
+// A live pack (pushed uploads) polls nothing -- refreshFleet skips its card
+// itself -- and while any pack is live the pack list is read every 5 min.
+setInterval(() => { if (!livePack(PACK)) pollLatest(); }, 30000);
+setInterval(() => { if (!livePack(PACK)) refreshHistory(); }, 30000);
 setInterval(refreshFleet, 30000);
-setInterval(loadPacks, 60000);
+setInterval(() => {
+  if (!liveWanted().some(livePack) || Date.now() - packsAt >= 5 * 60 * 1000) loadPacks();
+}, 60000);
+// live: a link without keep-alives is dead; a live view is re-read every
+// LIVE_RESYNC_MS; a connection is replaced (subscribed first, then swapped)
+// before its sign-in token expires and before AppSync's 24 h limit
+setInterval(() => {
+  const c = live.conn, now = Date.now();
+  if (c && c.up && now - c.kaAt > c.kaMs) return liveDrop(c);
+  for (const pid of liveWanted()) {
+    if (livePack(pid) && now - (live.syncAt.get(pid) || 0) > LIVE_RESYNC_MS) liveResync(pid);
+  }
+  if (c && c.up && !live.next && (now - c.at > LIVE_ROTATE_MS || now > c.tokExp - LIVE_TOKEN_MARGIN_MS)) {
+    liveConnect(true);
+  }
+}, 10000);
 setInterval(() => {
   renderAge();
   if (view === "fleet") for (const s of slots) renderSlotStatus(s);

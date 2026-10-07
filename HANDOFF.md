@@ -655,6 +655,33 @@ pipeline; polling `/latest` every 10 s while a pack moves would add ~$6.60
 and needs the query Lambda's `/latest` cache cut to ~8 s for moving packs
 (not done). Still open: `/track` lacks `net_age_s`.
 
+**Done (2026-10-07): live push for internal viewers ("H").** A tab left open
+polled InfluxDB for ~$53/month; internal accounts now get each upload pushed.
+AWS AppSync Events API `helt-live` (id `jydrbatytffidm2mqngi7muxxq`):
+connect/subscribe with a `helt-users` token (dashboard client; access or ID
+token), publish IAM only. Namespace `packs`, channel `/packs/<pack_id>`; its
+onSubscribe handler (`aws/live_packs_handler.js`, data source `entitlements`
+via role `helt-live-appsync-ddb`, GetItem only) admits only a caller whose `*`
+row holds ALL. The shared ingest source (both functions redeployed, env
+`EVENTS_HOST`; inline policy `helt-live-publish` on `helt-lambda-role` /
+`sandbox-lambda-role`) publishes each telemetry upload after the InfluxDB
+write -- the samples as written + its faults -- best-effort (2 s timeout,
+failures logged as WARN, never fails the write; +~0.3 s per invocation,
+AppSync's own publish time). Dashboard: subscribes to the shown view's packs;
+a refused subscribe (customer) closes it and that tab polls as before. While
+a pack is live its view polls nothing and applies each upload as the next
+poll would (`<live-merge>`: /latest's 15-min window, chart windows as
+`aggregateWindow` labels them, SoC trend, faults, path via `mergeLive`); on
+(re)subscribing and every 6 h it re-reads that pack once; `/packs` every
+5 min. Failures fall back to polling at once and reconnect with backoff; a
+connection is replaced (new one subscribed first) 3 min before its token
+expires and before AppSync's 24 h limit. Measured: pack reading -> screen
+~2 s (Lambda publish -> browser ~0.5 s); no API call in 95 s with all three
+fleet cards live. Per internal tab open 24/7 ~$2.4/month (~$2.1 is the 5-min
+`/packs`). Gotcha: an Events handler with a data source needs method
+shorthand (`{ request(ctx) {...} }`); `{request: fn}` fails live with
+HandlerExecutionError although `aws appsync evaluate-code` accepts only it.
+
 **Next for the real pack:** the firmware repo's open issue on the internal-RAM
 budget with Wi-Fi up (instrument the boot, trim the Wi-Fi buffer pools, LVGL
 allocation audit) is the one thing 7C surfaced that is not fixed -- it is a

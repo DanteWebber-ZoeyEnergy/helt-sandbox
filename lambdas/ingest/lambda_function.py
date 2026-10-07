@@ -17,6 +17,11 @@ Environment variables (set on the Lambda):
     INFLUXDB_TOKEN   -- write-scoped API token (secret)
     INFLUXDB_BUCKET  -- target bucket, e.g. helt_prod
     INFLUXDB_ORG     -- org name or ID
+    EVENTS_HOST      -- optional: the AppSync Events HTTP host
+                        (<id>.appsync-api.<region>.amazonaws.com) of `helt-live`.
+                        Set = every telemetry upload is also pushed live to the
+                        dashboard's internal viewers (see publish_live). Unset =
+                        no push, the write path exactly as before.
 
 Trigger: AWS IoT Rule `helt_to_influx` (and `sandbox_to_influx`) on SQL
     SELECT *, topic() AS mqtt_topic FROM 'helt/pack/+/+'
@@ -24,7 +29,7 @@ Trigger: AWS IoT Rule `helt_to_influx` (and `sandbox_to_influx`) on SQL
 Stdlib only -- no Lambda layers.
 """
 
-import json, os, time, urllib.request, urllib.error
+import datetime, hashlib, hmac, http.client, json, os, re, time, urllib.request, urllib.error
 
 INFLUXDB_URL    = os.environ["INFLUXDB_URL"]
 INFLUXDB_TOKEN  = os.environ["INFLUXDB_TOKEN"]
@@ -90,6 +95,8 @@ def lambda_handler(event, context):
 
     pack_id, suffix = parts[2], parts[3]
     lines = []
+    # what this upload adds, exactly as written: pushed after the write
+    live = {"pack_id": pack_id, "samples": [], "faults": []}
 
     if suffix == "telemetry" and event.get("schema") == "v1":
         samples = event.get("samples", [])
@@ -112,14 +119,16 @@ def lambda_handler(event, context):
                 ts = int(anchor["ts"]) - (int(anchor["seq"]) - int(s["seq"]))
             tags = f"pack_id={esc_tag(pack_id)},ts_synced={'true' if s.get('ts_synced') else 'false'}"
             fields = []
+            vals = {}                  # the same values, for the live push
             for f in UINT_FIELDS:
-                if f in s: fields.append(f"{f}={int(s[f])}u")
+                if f in s: vals[f] = int(s[f]); fields.append(f"{f}={vals[f]}u")
             for f in FLOAT_FIELDS:
-                if f in s: fields.append(f"{f}={float(s[f])}")
+                if f in s: vals[f] = float(s[f]); fields.append(f"{f}={vals[f]}")
             for f in INT_FIELDS:
-                if f in s: fields.append(f"{f}={int(s[f])}i")
+                if f in s: vals[f] = int(s[f]); fields.append(f"{f}={vals[f]}i")
             if fields:
                 lines.append(f"telemetry,{tags} {','.join(fields)} {ts}")
+                live["samples"].append({"ts": ts, "ts_synced": bool(s.get("ts_synced")), **vals})
 
             # Interval summary faults (Phase L3): one point each, dated at the
             # sample's (anchored) ts minus its age. Two of the same code in
@@ -136,6 +145,8 @@ def lambda_handler(event, context):
                 ftags = (f"pack_id={esc_tag(pack_id)},src={fault_source(code)},"
                          f"code=0x{code:02X}")
                 lines.append(f"pack_fault,{ftags} n=1u {ts - age}")
+                live["faults"].append({"t": ts - age, "src": fault_source(code),
+                                       "code": f"0x{code:02X}"})
         if dropped:
             print(f"WARN: {pack_id}: dropped {dropped} unsynced samples "
                   f"({dropped_faults} faults) (no synced anchor in batch)")
@@ -173,7 +184,90 @@ def lambda_handler(event, context):
                 # answer -- so swallow it; the ERROR line above is the record.
                 return {"statusCode": 200, "body": f"influx {e.code}: {len(lines)} lines rejected"}
             raise
+        if live["samples"]:
+            publish_live(live)
     return {"statusCode": 200, "body": f"{len(lines)} lines"}
+
+
+# ---- live push (dashboard "H"): internal viewers get each upload in seconds --
+# After the InfluxDB write -- never before, never instead -- the upload's
+# samples (as written: anchored ts, known fields, typed) and faults go to the
+# AppSync Events channel /packs/<pack_id> of the `helt-live` Event API, which
+# only internal users may subscribe to (its onSubscribe handler checks the '*'
+# ALL row in helt_entitlements). Best-effort: a short timeout, every failure
+# logged as a WARN and swallowed, so the write and the Lambda's result never
+# depend on it (a lost push costs the viewer nothing: the dashboard re-reads
+# the API on reconnect and falls back to polling). Signed with the function
+# role's credentials (appsync:EventPublish on the `packs` namespace).
+EVENTS_HOST = os.environ.get("EVENTS_HOST", "")
+EVENTS_TIMEOUT_S = 2.0
+# a channel segment: 1-50 alphanumerics and dashes, not starting/ending with one
+CHANNEL_SEG = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,48}[A-Za-z0-9])?$")
+_events_conn = None            # kept across warm invocations: no TLS handshake each time
+
+
+def sigv4(method, host, path, query, headers, body, region, service, key_id, secret, token, now):
+    """AWS Signature V4: `headers` plus host, x-amz-date, the session token
+    (if any) and authorization. `query` is the canonical query string."""
+    amz_date, day = now.strftime("%Y%m%dT%H%M%SZ"), now.strftime("%Y%m%d")
+    h = {k.lower(): str(v).strip() for k, v in headers.items()}
+    h.update({"host": host, "x-amz-date": amz_date})
+    if token:
+        h["x-amz-security-token"] = token
+    signed = ";".join(sorted(h))
+    canonical = "\n".join([method, path, query,
+                           "".join(f"{k}:{h[k]}\n" for k in sorted(h)),
+                           signed, hashlib.sha256(body).hexdigest()])
+    scope = f"{day}/{region}/{service}/aws4_request"
+    to_sign = "\n".join(["AWS4-HMAC-SHA256", amz_date, scope,
+                         hashlib.sha256(canonical.encode()).hexdigest()])
+    k = ("AWS4" + secret).encode()
+    for part in (day, region, service, "aws4_request"):
+        k = hmac.new(k, part.encode(), hashlib.sha256).digest()
+    sig = hmac.new(k, to_sign.encode(), hashlib.sha256).hexdigest()
+    h["authorization"] = (f"AWS4-HMAC-SHA256 Credential={key_id}/{scope}, "
+                          f"SignedHeaders={signed}, Signature={sig}")
+    return h
+
+
+def publish_live(upload):
+    """POST one upload to /packs/<pack_id>. Never raises."""
+    global _events_conn
+    pack_id = upload["pack_id"]
+    if not EVENTS_HOST or not CHANNEL_SEG.match(pack_id):
+        return
+    t0 = time.monotonic()
+    try:
+        body = json.dumps({"channel": f"/packs/{pack_id}",
+                           "events": [json.dumps(upload, separators=(",", ":"))]},
+                          separators=(",", ":")).encode()
+        for attempt in (1, 2):
+            reused = _events_conn is not None
+            try:
+                if _events_conn is None:
+                    _events_conn = http.client.HTTPSConnection(EVENTS_HOST, timeout=EVENTS_TIMEOUT_S)
+                headers = sigv4("POST", EVENTS_HOST, "/event", "",
+                                {"content-type": "application/json"}, body,
+                                os.environ.get("AWS_REGION", "us-east-1"), "appsync",
+                                os.environ["AWS_ACCESS_KEY_ID"], os.environ["AWS_SECRET_ACCESS_KEY"],
+                                os.environ.get("AWS_SESSION_TOKEN"),
+                                datetime.datetime.now(datetime.timezone.utc))
+                _events_conn.request("POST", "/event", body=body, headers=headers)
+                r = _events_conn.getresponse()
+                ans = r.read()
+                break
+            except (http.client.RemoteDisconnected, ConnectionResetError, BrokenPipeError):
+                # the kept connection was closed by the far end while idle:
+                # once, on a fresh one, if there is time
+                _events_conn = None
+                if attempt == 2 or not reused or time.monotonic() - t0 > EVENTS_TIMEOUT_S / 2:
+                    raise
+        if r.status != 200 or json.loads(ans or b"{}").get("failed"):
+            print(f"WARN: live push {pack_id}: HTTP {r.status} {ans[:200]!r}")
+    except Exception as e:
+        _events_conn = None
+        print(f"WARN: live push {pack_id}: {type(e).__name__}: {e} "
+              f"({(time.monotonic() - t0) * 1000:.0f} ms)")
 
 def esc_tag(s):  return s.replace(" ","\\ ").replace(",","\\,").replace("=","\\=")
 # Backslash first, then the quote: the other order doubles the backslash it
