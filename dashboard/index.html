@@ -288,6 +288,25 @@
   .leaflet-tooltip.fleet-label { font: 500 .78rem Roboto, Arial, sans-serif; color: var(--ink);
                                  border-color: var(--hairline); box-shadow: none;
                                  padding: .1rem .4rem; }
+  /* "Open in Google Maps": a pin at the pack's shown position, in a new tab
+     (the Google Maps app on a phone) */
+  .gmaps { font-size: .78rem; color: var(--ink-2); white-space: nowrap;
+           text-decoration: underline dotted var(--muted); text-underline-offset: 3px; }
+  .gmaps:hover { color: var(--red-dk); }
+  .gmaps[hidden] { display: none; }
+  .facts .gmaps { display: block; width: fit-content; margin-top: .15rem; }
+  /* hovering a pack's current position: where it is, and the same link */
+  .pos-pop .leaflet-popup-content-wrapper { border-radius: 8px;
+                                            box-shadow: 0 2px 10px rgba(51,62,72,.18); }
+  .pos-pop .leaflet-popup-content { margin: .55rem .75rem; min-width: 11rem;
+                                    font: .8rem/1.45 Roboto, Arial, sans-serif; color: var(--ink); }
+  .pos-pop b { font-weight: 500; }
+  .pos-pop .pp-sub { color: var(--ink-2); }
+  .pos-pop .pp-ll { color: var(--muted); font-variant-numeric: tabular-nums; }
+  .pos-pop .gmaps { display: inline-block; margin-top: .3rem; }
+  .leaflet-container .gmaps { color: var(--ink-2); }      /* not Leaflet's link blue */
+  .leaflet-container .gmaps:hover { color: var(--red-dk); }
+  .pos-pop .pp-hint { color: var(--muted); font-size: .72rem; margin-top: .15rem; }
 
   /* ---- login gate (spec S1 — a gate, not the future login UX) ---- */
   .login { position: fixed; inset: 0; z-index: 2000; background: var(--page);
@@ -319,6 +338,7 @@
   .livebadge { display: inline-flex; align-items: center; gap: .35rem;
                font-size: .8rem; color: var(--ink-2); }
   .livebadge .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--green); }
+  .livebadge[hidden] { display: none; }      /* its display would beat the attribute */
 
   .err { color: var(--red-dk); font-size: .85rem; margin-top: 1rem; min-height: 1.2em; }
   footer { max-width: 2400px; margin: 0 auto; padding: 0 1.5rem 2rem;
@@ -494,6 +514,7 @@
         <span id="lgPackParked" hidden><i class="parked gnss"></i>Parked earlier</span>
       </span>
       <span class="coords" id="coords">–</span>
+      <a class="gmaps" id="packGmaps" target="_blank" rel="noopener" hidden>Open in Google Maps ↗</a>
       <label class="mapswitch" title="On: a parked pack shows as one spot, its most likely position. Off: every position reading as it came in.">
         <input type="checkbox" class="posfilter" checked><span>Filter parked positions</span></label>
       <button type="button" class="mapbtn" aria-pressed="false">⤢ Full screen</button>
@@ -1870,6 +1891,80 @@ function lastPos30(pid, then) {
   return e.pos;
 }
 
+/* ------ the shown position: "Open in Google Maps" and a hover popup ------
+   The link is a Google Maps URL (no key, no account): a pin at the position,
+   in a new tab -- the Google Maps app on a phone. The pack's coordinates go
+   to Google only when someone follows it. */
+const gmapsUrl = (lat, lon) =>
+  `https://www.google.com/maps/search/?api=1&query=${Number(lat).toFixed(6)},${Number(lon).toFixed(6)}`;
+function gmapsLink(lat, lon) {
+  const a = document.createElement("a");
+  a.className = "gmaps";
+  a.href = gmapsUrl(lat, lon);
+  a.target = "_blank"; a.rel = "noopener";
+  a.textContent = "Open in Google Maps ↗";
+  return a;
+}
+// {title, lines, lat, lon, hint} -> the popup's content
+function posPopupContent(i) {
+  const box = document.createElement("div");
+  const line = (cls, text) => {
+    const d = document.createElement("div");
+    if (cls) d.className = cls;
+    d.textContent = text;
+    return box.appendChild(d);
+  };
+  if (i.title) line("", "").appendChild(document.createElement("b")).textContent = i.title;
+  for (const l of i.lines || []) if (l) line("pp-sub", l);
+  line("pp-ll", `${Number(i.lat).toFixed(5)}, ${Number(i.lon).toFixed(5)}`);
+  box.appendChild(gmapsLink(i.lat, i.lon));
+  if (i.hint) line("pp-hint", i.hint);
+  return box;
+}
+// One hover popup per map; returns hover(layer, key, info): pointing at
+// `layer` opens it with info() ({title, lines, lat, lon, hint}, or null for
+// none). It stays open while the pointer is on the marker or on the popup
+// (so its link can be clicked) and closes shortly after it leaves both. A
+// marker redrawn while it is open (the fleet map redraws on every upload)
+// takes it over when given the same key.
+function hoverPopup(lmap) {
+  const pop = L.popup({ closeButton: false, autoPan: false, offset: [0, -6], maxWidth: 280,
+                        className: "pos-pop" });
+  let key = null, info = null, onMarker = false, onPop = false, timer = 0, wired = false;
+  const close = () => { clearTimeout(timer); lmap.closePopup(pop); key = null; };
+  const later = () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => { if (!onMarker && !onPop) close(); }, 250);
+  };
+  const fill = () => {
+    const i = info && info();
+    if (!i) { close(); return false; }
+    pop.setLatLng([i.lat, i.lon]).setContent(posPopupContent(i));
+    return true;
+  };
+  pop.on("add", () => {
+    if (wired) return;
+    wired = true;
+    const el = pop.getElement();
+    el.addEventListener("mouseenter", () => { onPop = true; clearTimeout(timer); });
+    el.addEventListener("mouseleave", () => { onPop = false; later(); });
+  });
+  // the pointer on the map itself, or off it: not on the marker any more
+  lmap.on("mousemove", () => { if (!onMarker && !onPop && key) later(); });
+  lmap.on("mouseout", () => { onMarker = false; later(); });
+  const hover = (layer, k, fn) => {
+    layer.on("mouseover", () => {
+      onMarker = true; clearTimeout(timer);
+      key = k; info = fn;
+      if (fill()) lmap.openPopup(pop);
+    });
+    layer.on("mouseout", () => { onMarker = false; later(); });
+    if (key === k && lmap.hasLayer(pop)) { info = fn; onMarker = false; fill(); }   // redrawn while open
+  };
+  hover.close = close;
+  return hover;
+}
+
 /* --------------------------------- map ----------------------------------- */
 const map = L.map("map", { zoomControl: true, attributionControl: true });
 L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png",
@@ -1960,6 +2055,23 @@ async function loadPackTrack() {
 const marker = L.marker([-33.9249, 18.4241],
   { icon: L.divIcon({ className: "", html: '<div class="pack-marker"></div>',
                       iconSize: [14, 14], iconAnchor: [7, 7] }) }).addTo(map);
+// What the pack map's markers show (drawPackPosition fills it), for their
+// hover popups; the header's Google Maps link goes to the one in front.
+const packPop = hoverPopup(map);
+const packPos = { gnss: null, net: null };
+packPop(marker, "gnss", () => marker.options.opacity > 0 ? packPos.gnss : null);
+function setPackPos(gnss, net, front) {
+  packPos.gnss = gnss; packPos.net = net;
+  $("packGmaps").hidden = !front;
+  if (front) $("packGmaps").href = gmapsUrl(front.lat, front.lon);
+}
+// the network position's marker (on netNow), with its hover popup
+function netMarker(lat, lon, opts = {}) {
+  const m = L.marker([lat, lon], { ...opts, icon: L.divIcon({ className: "",
+    html: '<div class="net-marker"></div>', iconSize: [14, 14], iconAnchor: [7, 7] }) }).addTo(netNow);
+  packPop(m, "net", () => packPos.net);
+  return m;
+}
 // Network position (AWS IoT Core Device Location from WiFi networks and/or
 // the serving cell; only while the GNSS has no usable fix): a blue marker
 // inside its 68 % accuracy circle, plus each distinct earlier position in the
@@ -2310,10 +2422,12 @@ function drawPackPosition() {
     $("lgNet").hidden = g;
     marker.setLatLng([st.lat, st.lon]).setOpacity(g ? 1 : 0);
     netNow.clearLayers();
+    const info = { title: PACK, lat: st.lat, lon: st.lon, lines: [
+      `Parked since ${whenText(st.t0)} (${durText(Date.now() / 1000 - st.t0)})`, parkedText(st)] };
+    setPackPos(g ? info : null, g ? null : info, info);
     if (!g) {
       L.circle([st.lat, st.lon], { ...NET_STYLE, radius: st.acc || 0, interactive: false }).addTo(netNow);
-      L.marker([st.lat, st.lon], { icon: L.divIcon({ className: "",
-        html: '<div class="net-marker"></div>', iconSize: [14, 14], iconAnchor: [7, 7] }) }).addTo(netNow);
+      netMarker(st.lat, st.lon);
     }
     $("coords").textContent = `parked since ${whenText(st.t0)} (${durText(Date.now() / 1000 - st.t0)}) · ` +
       `${st.lat.toFixed(5)}, ${st.lon.toFixed(5)} · ${parkedText(st)}`;
@@ -2336,18 +2450,23 @@ function drawPackPosition() {
   marker.setOpacity(!hasG ? 0 : (gNow || !nNow) ? 1 : .35);
   netNow.clearLayers();
   const parts = [];
+  const at = k => tts && tts[k] ? whenSecText(tts[k]) : "";
+  const gInfo = hasG ? { title: PACK, lat: t.lat, lon: t.lon,
+                         lines: [(gNow ? "GNSS fix" : "Last GNSS fix") + (at("lat") ? ` · ${at("lat")}` : "")] } : null;
+  let nInfo = null;
   if (hasG) parts.push(`${Number(t.lat).toFixed(5)}, ${Number(t.lon).toFixed(5)}` +
                        (gNow ? "" : " (last GNSS fix)"));
   if (nNow) {
     const acc = Number(t.net_acc_m ?? 0);
     L.circle([t.net_lat, t.net_lon], { ...NET_STYLE, radius: acc, interactive: false }).addTo(netNow);
-    L.marker([t.net_lat, t.net_lon], { icon: L.divIcon({ className: "",
-      html: '<div class="net-marker"></div>', iconSize: [14, 14], iconAnchor: [7, 7] }) })
-      .addTo(netNow);
+    netMarker(t.net_lat, t.net_lon);
     const age = t.net_age_s != null ? `, measured ${Math.round(t.net_age_s / 60)} min ago` : "";
     parts.push(`network ${Number(t.net_lat).toFixed(4)}, ${Number(t.net_lon).toFixed(4)}` +
                ` ± ${fmt(acc, 0)} m (${NET_SRC[t.net_src] || "?"}${age})`);
+    nInfo = { title: PACK, lat: t.net_lat, lon: t.net_lon,
+              lines: [`Network ± ${fmt(acc, 0)} m (${NET_SRC[t.net_src] || "?"}${age})`, at("net_lat")] };
   }
+  setPackPos(gInfo, nInfo, gNow ? gInfo : nInfo || gInfo);
   $("coords").textContent = parts.join(" · ") || "–";
   if (!mapFitted && (gNow || nNow || hasG)) {
     if (nNow && !gNow) map.setView([t.net_lat, t.net_lon], 15);
@@ -2370,6 +2489,7 @@ function drawLastKnown(t, tts, updated, hasG, hasN) {
   setMapVisible(!!lp || !!packPathV);
   if (!lp) {
     marker.setOpacity(0);
+    setPackPos(null, null, null);
     $("coords").textContent = "no position reported";
     return;
   }
@@ -2377,11 +2497,15 @@ function drawLastKnown(t, tts, updated, hasG, hasN) {
   $("lgGnss").hidden = !g;
   $("lgNet").hidden = g;
   marker.setLatLng([lp.lat, lp.lon]).setOpacity(g ? .5 : 0);
+  const info = { title: PACK, lat: lp.lat, lon: lp.lon, lines: [
+    `Last known position${lp.t ? `, ${whenText(lp.t)}` : ""}`,
+    (g ? "GNSS" : `Network ± ${fmt(lp.acc, 0)} m` + (NET_SRC[lp.src] ? ` (${NET_SRC[lp.src]})` : "")) +
+      " · no position reported since"] };
+  setPackPos(g ? info : null, g ? null : info, info);
   if (!g) {
     L.circle([lp.lat, lp.lon], { ...NET_STYLE, opacity: .4, fillOpacity: .05, radius: lp.acc || 0,
                                  interactive: false }).addTo(netNow);
-    L.marker([lp.lat, lp.lon], { opacity: .5, icon: L.divIcon({ className: "",
-      html: '<div class="net-marker"></div>', iconSize: [14, 14], iconAnchor: [7, 7] }) }).addTo(netNow);
+    netMarker(lp.lat, lp.lon, { opacity: .5 });
   }
   $("coords").textContent = `last known position ${lp.t ? whenText(lp.t) : ""} · ` +
     `${Number(lp.lat).toFixed(5)}, ${Number(lp.lon).toFixed(5)} · ` +
@@ -2602,6 +2726,8 @@ function selectPack(pid) {
   $("lgPackParked").hidden = true;
   netTrail.clearLayers();
   netNow.clearLayers();
+  setPackPos(null, null, null);
+  packPop.close();
   mapFitted = false;                                // re-center on the new pack
   lastUpdatedTs = null;
   histLoaded = false;
@@ -2747,6 +2873,20 @@ L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png",
   { maxZoom: 19, attribution: "&copy; OpenStreetMap contributors" }).addTo(fleetMap);
 fleetMap.setView([-33.9249, 18.4241], 11);
 const fleetLayer = L.layerGroup().addTo(fleetMap);
+const fleetPop = hoverPopup(fleetMap);
+// a card's pack on the fleet map, for its marker's hover popup
+function slotPopInfo(s) {
+  const p = s.pid && slotShown(s);
+  if (!p) return null;
+  const src = p.kind === "gnss" ? "GNSS fix"
+    : `Network ± ${fmt(p.acc, 0)} m` + (NET_SRC[p.src] ? ` (${NET_SRC[p.src]})` : "");
+  const lines = p.parked
+    ? [`Parked since ${whenText(p.parked.t0)} (${durText(Date.now() / 1000 - p.parked.t0)})`, parkedText(p.parked)]
+    : p.current || !p.t ? [src + (p.t ? ` · ${whenSecText(p.t)}` : "")]
+    : [`Last known position, ${whenText(p.t)}`, `${src} · no position reported since`];
+  return { title: `${s.pid} · ${slotOnline(s).online ? "online" : "offline"}`, lines,
+           lat: p.lat, lon: p.lon, hint: "Click the marker for all the pack's data" };
+}
 // Each pack's path over the last 24 h, under the markers: the line in its own
 // pane above the accuracy circles, the arrowheads above the line.
 fleetMap.createPane("trails").style.zIndex = 420;
@@ -3051,6 +3191,7 @@ function renderSlot(s) {
         (p.parked ? ` · ${parkedText(p.parked)}`
          : p.current || !p.t ? "" : ` · ${src} · no position reported since`),
         () => focusPack(s));
+    rows.at(-1).link = p;
   }
   e.facts.replaceChildren(...rows.flatMap(r => {
     const dt = document.createElement("dt");
@@ -3070,6 +3211,7 @@ function renderSlot(s) {
       sub.className = "sub"; sub.textContent = r.sub;
       dd.appendChild(sub);
     }
+    if (r.link) dd.appendChild(gmapsLink(r.link.lat, r.link.lon));
     return [dt, dd];
   }));
 }
@@ -3100,14 +3242,13 @@ function renderFleetMap() {
       icon: L.divIcon({ className: "", iconSize: [14, 14], iconAnchor: [7, 7],
                         html: `<div class="${p.kind === "gnss" ? "pack-marker" : "net-marker"}"></div>` }),
       opacity: !online ? .6 : stale ? .5 : 1,
-      title: (p.parked ? `${s.pid} · parked since ${whenText(p.parked.t0)} ` +
-                         `(${durText(Date.now() / 1000 - p.parked.t0)}) · ` : "") + `open ${s.pid}`,
     }).bindTooltip(s.pid + (online ? "" : " (offline)") +
                    (stale ? ` · last position ${whenText(p.t)}` : ""),
                    { permanent: true, direction: LABEL_DIR[s.i], offset: LABEL_OFF[s.i],
                      className: "fleet-label" })
       .on("click", () => openPack(s.pid))
       .addTo(fleetLayer);
+    fleetPop(s.marker, `pack:${s.pid}`, () => slotPopInfo(s));
     pts.push([p.lat, p.lon]);
   }
   setFleetMapVisible(pts.length > 0);
@@ -3268,6 +3409,8 @@ function openPack(pid) { location.hash = `#pack/${encodeURIComponent(pid)}`; }
 
 function showView(v, fetch = true) {
   collapseMaps();
+  packPop.close();
+  fleetPop.close();
   if (v !== view) window.scrollTo(0, 0);
   view = v;
   document.body.dataset.view = v;
