@@ -1355,7 +1355,20 @@ const NET_BLUE = "#2a78d6";               // --s1, the network position's hue
    stays within MERGE_M are one (what lay between was wander). A stay's
    position is the densest cluster of its GNSS fixes (a stray fix moves it
    nowhere); with fewer than MIN_GNSS fixes, its network (WiFi / cell)
-   position. Moves shorter than R_M do not show while filtering is on.
+   position. Moves shorter than R_M do not show while filtering is on,
+   unless the pack reports them at its moving rate (movingFlags -- its own
+   motion detection): such GNSS fixes must lie within R_MOVE_M of the spot,
+   and an excursion that starts at that rate leaves after LEAVE_MOVE_S
+   outside it -- or rejoins the stay if it is back within R_MOVE_M in
+   LEAVE_S. So a slow drive round a few streets is no stay (HELT-0001,
+   2026-10-07 17:10-17:28: 2.9 km within ~400 m of one spot was drawn as
+   parked), nor is the drive into one (parkedStays). Fixes only: a network
+   position is ~100 m coarse. The firmware also takes bad GNSS for motion
+   (HELT-0003 parked, 2026-10-01/02: fixes 100-300 m off, some frozen, at
+   the moving rate), hence the wide R_MOVE_M. Set from the three packs'
+   week to 2026-10-08: the drives in town drawn 98-100 % (were 55-90 %),
+   every stay at the same spot, no night drawn; live, HELT-0003 on those
+   two days shows 7 marker wobbles more (5 of 1-2 min, 2 of 10-13 min).
    The newest readings outside the last stay end it (the pack left) once
    LEAVE_S pass with no reading back, or at once while the pack uploads at
    its moving rate (its own motion detection) -- so a parked pack's stray
@@ -1363,7 +1376,8 @@ const NET_BLUE = "#2a78d6";               // --s1, the network position's hue
    positions to the path readings (mergeLive) until the next /track
    re-read replaces them, so the path runs up to the marker. */
 const PARK = { R_M: 250, MIN_S: 600, LEAVE_S: 300, MERGE_M: 150, MERGE_GAP_S: 3600,
-               BW_M: 15, MIN_GNSS: 10, MAX_FIT_PTS: 1500 };
+               BW_M: 15, MIN_GNSS: 10, MAX_FIT_PTS: 1500,
+               MOVE_GAP_S: 20, MOVE_MIN_N: 4, R_MOVE_M: 150, LEAVE_MOVE_S: 120, JUMP_MPS: 50 };
 // Uploading at the moving rate: a moving pack publishes every 10 s
 // (firmware CLOUD_MOVING_PERIOD_S), a parked one every 300 s
 // (CLOUD_CELL_BATCH_PERIOD_S); 90 s lies between, with room for the 30 s
@@ -1431,13 +1445,43 @@ function stayPosition(rd, i0, i1) {
   if (n.length) return { ...medianLL(n), src: "n", n: n.length, acc: medianOf(n.map(p => p.acc)) };
   return { ...medianLL(g), src: "g", n: g.length };
 }
+// Readings taken at the pack's moving rate (1 = moving): runs of MOVE_MIN_N
+// or more, each within MOVE_GAP_S of the last. A moving pack samples every
+// 10 s, a still one every 30 s (firmware CLOUD_MOVING_PERIOD_S / its motion
+// detection), and /track keeps that apart: 15-s windows up to 24h, raw for
+// 15m (7d's 5-min windows lose it: the R_M rule alone there). Not a jump
+// that comes back: a GNSS step faster than JUMP_MPS into or out of readings
+// that return, within LEAVE_S, to within R_MOVE_M of where they left
+// (HELT-0002, 2026-09-30 14:28: 1.7 km out for 4.5 min, back at 118 m/s,
+// all at the moving rate).
+function movingFlags(rd) {
+  const f = new Uint8Array(rd.length);
+  let a = 0;
+  for (let i = 1; i <= rd.length; i++) {
+    if (i < rd.length && rd[i].t - rd[i - 1].t <= PARK.MOVE_GAP_S) continue;
+    if (i - a >= PARK.MOVE_MIN_N) f.fill(1, a, i);
+    a = i;
+  }
+  const jump = i => rd[i].src === "g" && rd[i - 1].src === "g" &&
+    distM(rd[i - 1], rd[i]) > PARK.JUMP_MPS * Math.max(1, rd[i].t - rd[i - 1].t);
+  for (let i = 1; i < rd.length; i++) {
+    if (!jump(i)) continue;
+    for (let k = i + 1; k < rd.length && rd[k - 1].t - rd[i].t <= PARK.LEAVE_S; k++) {
+      if (distM(rd[i - 1], rd[k]) <= PARK.R_MOVE_M) { f.fill(0, i, k); break; }
+    }
+    for (let j = i - 2; j >= 0 && rd[i - 1].t - rd[j + 1].t <= PARK.LEAVE_S; j--) {
+      if (distM(rd[j], rd[i]) <= PARK.R_MOVE_M) { f.fill(0, j + 1, i); break; }
+    }
+  }
+  return f;
+}
 // Stays as index ranges [i0, i1] of rd (contiguous); readings outside every
 // stay are movement. The running centre (median of the GNSS fixes so far) is
 // recomputed as the stay grows by 10 %, keeping this ~linear in readings.
-function findStays(rd) {
+function findStays(rd, mv = movingFlags(rd)) {
   const stays = [];
   if (!rd.length) return stays;
-  let i0 = 0, i1 = 0, out0 = -1, cache = null;
+  let i0 = 0, i1 = 0, out0 = -1, outMv = false, cache = null, back = null;
   const centre = () => {
     const n = i1 - i0 + 1;
     if (!cache || cache.i0 !== i0 || n >= cache.n * 1.1 + 5) {
@@ -1448,10 +1492,23 @@ function findStays(rd) {
   };
   const flush = (a, b) => { if (rd[b].t - rd[a].t >= PARK.MIN_S) stays.push({ i0: a, i1: b }); };
   for (let i = 1; i < rd.length; i++) {
-    if (distM(centre(), rd[i]) <= PARK.R_M) { i1 = i; out0 = -1; continue; }
-    if (out0 < 0) out0 = i;
-    if (rd[i].t - rd[out0].t >= PARK.LEAVE_S) {   // really left
+    // the moving rule for a GNSS fix at the moving rate, unless an excursion
+    // already under way began otherwise (bad GNSS: still-rate fixes far off,
+    // then the firmware wakes up on them)
+    const fast = mv[i] === 1 && rd[i].src === "g" && (out0 < 0 || outMv);
+    // back at the stay it just left on the moving rule: that was wander
+    if (back && rd[i].t - back.t1 > PARK.LEAVE_S) back = null;
+    if (back && rd[i].src === "g" && distM(back.c, rd[i]) <= PARK.R_MOVE_M) {
+      stays.pop(); i0 = back.i0; i1 = i; out0 = -1; cache = null; back = null;
+      continue;
+    }
+    if (distM(centre(), rd[i]) <= (fast ? PARK.R_MOVE_M : PARK.R_M)) { i1 = i; out0 = -1; continue; }
+    if (out0 < 0) { out0 = i; outMv = true; }
+    outMv = outMv && fast;
+    if (rd[i].t - rd[out0].t >= (outMv ? PARK.LEAVE_MOVE_S : PARK.LEAVE_S)) {   // really left
+      const n = stays.length, c = centre();
       flush(i0, out0 - 1);
+      back = outMv && stays.length > n ? { i0, c, t1: rd[out0 - 1].t } : null;
       // start over from the first reading away, one at a time: the readings
       // since may be on the move, not one new place
       i0 = i1 = i = out0; out0 = -1; cache = null;
@@ -1471,9 +1528,19 @@ function findStays(rd) {
 // findStays + merging stays that turn out to be the same place, each with
 // its position: [{i0, i1, t0, t1, lat, lon, src, n, acc?}]
 function parkedStays(rd) {
-  const out = [], found = findStays(rd);
+  const mv = movingFlags(rd), out = [], found = findStays(rd, mv);
   for (const s of found) {
     let st = { ...s, ...stayPosition(rd, s.i0, s.i1) };
+    // the drive in: a stay starts with the scan's first reading after the
+    // last departure, maybe still on the road (HELT-0001, 2026-10-07 13:36:
+    // past its spot, round to 290 m and back). Up to its last fix more than
+    // R_MOVE_M from the spot in its first LEAVE_S, while the pack reports
+    // moving, is movement.
+    let a = st.i0;
+    for (let j = st.i0; j < st.i1 && mv[j] && rd[j].t - rd[st.i0].t <= PARK.LEAVE_S; j++) {
+      if (rd[j].src === "g" && distM(st, rd[j]) > PARK.R_MOVE_M) a = j + 1;
+    }
+    if (a > st.i0) st = { i0: a, i1: st.i1, ...stayPosition(rd, a, st.i1) };
     const prev = out.at(-1);
     if (prev && rd[st.i0].t - rd[prev.i1].t <= PARK.MERGE_GAP_S && distM(prev, st) <= PARK.MERGE_M) {
       out.pop();

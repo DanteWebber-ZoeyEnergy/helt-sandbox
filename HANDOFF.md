@@ -655,6 +655,34 @@ pipeline; polling `/latest` every 10 s while a pack moves would add ~$6.60
 and needs the query Lambda's `/latest` cache cut to ~8 s for moving packs
 (not done). Still open: `/track` lacks `net_age_s`.
 
+**Done (2026-10-08): the parked filter keeps slow drives
+(dashboard only).** HELT-0001 drove round a few streets in Tshepisong on
+2026-10-07 17:10-17:28 (2.9 km, never more than ~400 m from one spot, never
+outside 250 m for 5 min) and the filter drew it as "parked 17:10-17:28"; the
+same hid 1.4 km at 12:36 and drives on 2026-10-02 14:37-15:20 (all three
+packs). The filter now uses the pack's own motion detection, which /track
+already carries: a moving pack samples every 10 s, a still one every 30 s,
+so runs of readings <= 20 s apart (15-s windows up to 24h, raw for 15m; 7d's
+5-min windows lose it and keep the old rule) are "at the moving rate". Such
+GNSS fixes must lie within 150 m of a stay (not 250 m), and an excursion
+that starts at that rate is a departure after 2 min outside it (not 5) --
+unless it is back within 150 m in 5 min (wander). A stay's first fixes at
+the moving rate more than 150 m from its spot are the drive in. Network
+positions keep the old rule (~100 m coarse), and a GNSS jump faster than
+50 m/s that returns is not motion (HELT-0002 2026-09-30 14:28: 1.7 km out
+for 4.5 min, back at 118 m/s, all at the moving rate). Not enough alone:
+HELT-0003's firmware reported motion while parked on 2026-10-01/02 (GNSS
+100-300 m off, some frozen), hence 150 m / 2 min, picked by a grid over
+the three packs' week to 2026-10-08. Checked offline through the page's own
+`<position-filter>` code on that week (`/track`-equivalent queries of
+`helt_prod`): the drives in town drawn 98-100 % of their raw path (were
+55-90 %), every stay at the same spot (0 m), no path on any night, the
+2026-10-01 ground-truth night unchanged in hindsight; live (each minute
+replayed with 5-min batches) HELT-0001 / 0002 unchanged, HELT-0003 shows 7
+more marker wobbles on 2026-10-01/02 (5 of 1-2 min, 2 of 10-13 min, the
+worst 215 m off) -- the price of the slow drives. Same answer in the
+browser (localhost, the 17:10 drive injected). No API change.
+
 **Done (2026-10-07): live push for internal viewers ("H").** A tab left open
 polled InfluxDB for ~$53/month; internal accounts now get each upload pushed.
 AWS AppSync Events API `helt-live` (id `jydrbatytffidm2mqngi7muxxq`):
